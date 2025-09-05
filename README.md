@@ -1,4 +1,4 @@
-# Reproducible Desktop Setup
+# Reproducible Linux Setup
 
 A powerful Rust-based tool for automating Linux desktop environment setup with support for multiple distributions, containerized applications, and dotfiles management.
 
