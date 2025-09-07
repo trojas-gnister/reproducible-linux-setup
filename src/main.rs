@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::fs;
 use std::process::{Command, Output};
 use std::env;
-use std::io::{self, Write};
+use std::io::{self, Write, BufRead};
 use std::path::Path;
 use dirs;
 
@@ -28,7 +28,7 @@ enum Distro {
 struct Config {
     distro: Distro,
     system: SystemConfig,
-    gnome: Option<GnomeConfig>,  // Modular for future desktop environments
+    desktop: Option<DesktopConfig>,
     podman: Option<PodmanConfig>,
     wireguard: Option<WireguardConfig>,
     dotfiles: Option<DotfilesConfig>,
@@ -38,10 +38,21 @@ struct Config {
 #[derive(Deserialize, Debug)]
 struct SystemConfig {
     hostname: Option<String>,
-    prefer_dark_theme: bool,
     enable_amd_gpu: bool,
     enable_rpm_fusion: bool,
     system_packages: Vec<String>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DesktopConfig {
+    environment: Option<String>,
+    packages: Option<Vec<String>>,
+    settings: Option<DesktopSettings>,
+}
+
+#[derive(Deserialize, Debug)]
+struct DesktopSettings {
+    gnome: Option<GnomeConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -75,7 +86,7 @@ struct Setting {
 
 #[derive(Deserialize, Debug)]
 struct PodmanConfig {
-    pre_container_setup: Vec<SetupCommand>,
+    pre_container_setup: Option<Vec<SetupCommand>>,
     containers: Vec<Container>,
 }
 
@@ -146,6 +157,11 @@ fn main() -> Result<()> {
         install_system_packages(&config.distro, &config.system.system_packages)?;
     }
 
+    // Desktop Environment Setup
+    if let Some(desktop_config) = &config.desktop {
+        setup_desktop_environment(&config.distro, desktop_config)?;
+    }
+
     // Enable additional repositories if configured
     if config.system.enable_rpm_fusion {
         enable_additional_repos(&config.distro)?;
@@ -159,13 +175,6 @@ fn main() -> Result<()> {
     // Flatpak setup
     setup_flatpak(&config.distro)?;
 
-    // Install Flatpak apps (GNOME specific)
-    if let Some(gnome) = &config.gnome {
-        for app in &gnome.flatpak_applications {
-            run_command(&["flatpak", "install", "-y", "flathub", &app.id], &format!("Installing {}", app.name.as_ref().unwrap_or(&app.id)))?;
-        }
-    }
-
     // Podman setup
     if let Some(podman) = &config.podman {
         if config.system.system_packages.contains(&"podman".to_string()) {
@@ -178,29 +187,57 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
             fs::create_dir_all(&config_dir)?;
             fs::write(config_dir.join("registries.conf"), registries_conf)?;
 
-            // Pre-container setup
-            for setup in &podman.pre_container_setup {
-                let cmd_parts: Vec<&str> = setup.command.split_whitespace().collect();
-                run_command(&cmd_parts, &setup.description)?;
+            let home_dir = dirs::home_dir().context("Could not find home directory")?;
+            let home_path = home_dir.to_str().context("Invalid home directory path")?;
+
+            if let Some(setups) = &podman.pre_container_setup {
+                for setup in setups {
+                    let command = setup.command.replace("$HOME", home_path);
+                    let cmd_parts: Vec<&str> = command.split_whitespace().collect();
+                    run_command(&cmd_parts, &setup.description)?;
+                }
+            }
+
+            // Reconciliation of managed containers
+            let managed_containers_output = Command::new("podman").args(&["ps", "-a", "--filter", "label=managed-by=repro-setup", "--format", "{{.Names}}"]).output()?;
+            let managed_containers = std::io::Cursor::new(managed_containers_output.stdout).lines().collect::<Result<Vec<_>, _>>()?;
+            let configured_containers: Vec<String> = podman.containers.iter().map(|c| c.name.clone()).collect();
+
+            for container_name in managed_containers {
+                if !configured_containers.contains(&container_name) {
+                    if ask_user_confirmation(&format!("Container '{}' is managed by this tool but not in the config. Remove it?", container_name))? {
+                        run_command(&["podman", "rm", "-f", &container_name], &format!("Removing orphaned container {}", container_name))?;
+                    }
+                }
             }
 
             // Pull and start containers
             for cont in &podman.containers {
+                let container_exists = std::io::Cursor::new(Command::new("podman").args(&["ps", "-a", "--format", "{{.Names}}"]).output()?.stdout).lines().any(|line| line.unwrap_or_default() == cont.name);
+
+                if container_exists {
+                    if ask_user_confirmation(&format!("Container '{}' already exists. Do you want to replace it?", cont.name))? {
+                        run_command(&["podman", "rm", "-f", &cont.name], &format!("Removing existing container {}", cont.name))?;
+                    } else {
+                        println!("{} Skipping container {}", "[INFO]".blue(), cont.name);
+                        continue;
+                    }
+                }
+
                 run_command(&["podman", "pull", &cont.image], &format!("Pulling container {}", cont.name))?;
 
                 if cont.auto_start {
-                    // Build command: podman run -d --name={name} {raw_flags} {image}
-                    let mut command = format!("podman run -d --name={}", cont.name);
+                    let mut command = format!("podman run -d --name={} --label managed-by=repro-setup", cont.name);
                     
                     if let Some(flags) = &cont.raw_flags {
+                        let replaced_flags = flags.replace("$HOME", home_path);
                         command.push(' ');
-                        command.push_str(flags);
+                        command.push_str(&replaced_flags);
                     }
                     
                     command.push(' ');
                     command.push_str(&cont.image);
 
-                    // Execute via shell to handle complex flag parsing
                     let output = Command::new("sh")
                         .arg("-c")
                         .arg(&command)
@@ -272,50 +309,6 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
         setup_dotfiles(dotfiles)?;
     }
 
-    // GNOME-specific setup
-    if let Some(gnome) = &config.gnome {
-        // Theme
-        if config.system.prefer_dark_theme {
-            run_command(&["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", "'prefer-dark'"], "Applying dark theme")?;
-            run_command(&["gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", "'Adwaita-dark'"], "Setting GTK theme")?;
-        } else {
-            run_command(&["gsettings", "set", "org.gnome.desktop.interface", "color-scheme", "'prefer-light'"], "Applying light theme")?;
-            run_command(&["gsettings", "set", "org.gnome.desktop.interface", "gtk-theme", "'Adwaita'"], "Setting GTK theme")?;
-        }
-
-        // Additional settings
-        for setting in &gnome.additional_settings {
-            run_command(&["gsettings", "set", &setting.schema, &setting.key, &setting.value], &format!("Setting {} {}", setting.schema, setting.key))?;
-        }
-
-        // Install gnome-extensions-cli
-        install_gnome_extensions_cli(&config.distro)?;
-
-        // Add to PATH if needed
-        let home = dirs::home_dir().unwrap();
-        let bin_path = home.join(".local/bin").to_string_lossy().to_string();
-        if !env::var("PATH")?.contains(&bin_path) {
-            // Note: This doesn't persist; user needs to add to .bashrc
-            println!("{}", format!("Add {} to PATH in your shell config.", bin_path).yellow());
-        }
-
-        // Install extensions
-        for ext in &gnome.extensions {
-            run_command(&["gext", "install", &ext.id.to_string()], &format!("Installing extension {}", ext.name))?;
-            if let Some(uuid) = &ext.uuid {
-                run_command(&["gext", "enable", uuid], &format!("Enabling extension {}", ext.name))?;
-            }
-        }
-
-        // Install fallback extension packages
-        install_extension_packages(&config.distro, &gnome.dnf_extension_packages)?;
-
-        // Enable extensions fallback
-        for uuid in &gnome.extensions_to_enable {
-            run_command(&["gnome-extensions", "enable", uuid], &format!("Enabling extension {}", uuid))?;
-        }
-    }
-
     // Execute custom commands
     if let Some(custom_commands) = &config.custom_commands {
         execute_custom_commands(custom_commands)?;
@@ -341,8 +334,12 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
 fn run_command(cmd: &[&str], desc: &str) -> Result<()> {
     println!("{} {}", "[INFO]".blue(), desc);
     let output = Command::new(cmd[0]).args(&cmd[1..]).output()?;
+
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+
     if !output.status.success() {
-        println!("{} {}: {:?}", "[ERROR]".red(), desc, String::from_utf8_lossy(&output.stderr));
+        println!("{} {}: Command failed", "[ERROR]".red(), desc);
         anyhow::bail!("Command failed");
     }
     println!("{} {}", "[SUCCESS]".green(), desc);
@@ -350,7 +347,10 @@ fn run_command(cmd: &[&str], desc: &str) -> Result<()> {
 }
 
 fn run_command_output(cmd: &[&str]) -> Result<Output> {
-    Command::new(cmd[0]).args(&cmd[1..]).output().context("Command failed")
+    let output = Command::new(cmd[0]).args(&cmd[1..]).output().context("Command failed")?;
+    io::stdout().write_all(&output.stdout)?;
+    io::stderr().write_all(&output.stderr)?;
+    Ok(output)
 }
 
 fn setup_dotfiles(config: &DotfilesConfig) -> Result<()> {
@@ -453,11 +453,7 @@ fn setup_config_dirs(project_dir: &Path, home_dir: &Path) -> Result<()> {
                         .with_context(|| format!("Failed to copy {} config from project", dir_name))?;
                     println!("{} Successfully replaced {} config", "[SUCCESS]".green(), dir_name);
                 } else {
-                    if ask_user_confirmation(&format!("Do you want to skip the {} config setup?", dir_name))? {
-                        println!("{} Skipping {} config setup", "[INFO]".blue(), dir_name);
-                    } else {
-                        println!("{} Please choose whether to replace or skip", "[INFO]".blue());
-                    }
+                    println!("{} Skipping {} config setup", "[INFO]".blue(), dir_name);
                 }
             } else {
                 println!("{} No existing {} config found, copying from project", "[INFO]".blue(), dir_name);
@@ -525,6 +521,9 @@ fn update_system_packages(distro: &Distro) -> Result<()> {
 }
 
 fn install_system_packages(distro: &Distro, packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
     match distro {
         Distro::Fedora => {
             let mut cmd: Vec<&str> = vec!["sudo", "dnf", "install", "-y", "--skip-unavailable"];
@@ -678,5 +677,153 @@ fn execute_custom_commands(config: &CustomCommandsConfig) -> Result<()> {
     }
     
     println!("{} All custom commands executed successfully!", "[SUCCESS]".green());
+    Ok(())
+}
+
+fn setup_desktop_environment(distro: &Distro, config: &DesktopConfig) -> Result<()> {
+    let de_env = config.environment.as_deref().unwrap_or("gnome");
+    println!("{} Setting up desktop environment: {}", "[INFO]".blue(), de_env);
+
+    validate_desktop_environment(distro, de_env)?;
+
+    let mut packages_to_install = vec![de_env.to_string()];
+    if let Some(additional_packages) = &config.packages {
+        packages_to_install.extend_from_slice(additional_packages);
+    }
+
+    install_desktop_packages(distro, &packages_to_install)?;
+
+    set_default_desktop_environment(distro, de_env)?;
+
+    if let Some(settings) = &config.settings {
+        if de_env == "gnome" {
+            if let Some(gnome_config) = &settings.gnome {
+                setup_gnome(distro, gnome_config)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_desktop_environment(distro: &Distro, de: &str) -> Result<()> {
+    println!("{} Validating desktop environment: {}", "[INFO]".blue(), de);
+    let available_des = get_available_des(distro)?;
+    if !available_des.contains(&de.to_lowercase()) {
+        anyhow::bail!("Desktop environment '{}' is not valid. Available options: {:?}", de, available_des);
+    }
+    Ok(())
+}
+
+fn get_available_des(distro: &Distro) -> Result<Vec<String>> {
+    match distro {
+        Distro::Fedora => {
+            let output = run_command_output(&["dnf", "group", "list", "--available"])?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let des = stdout.lines()
+                .skip_while(|line| !line.trim().starts_with("ID"))
+                .skip(1) // Skip the header line itself
+                .filter_map(|line| {
+                    line.split_whitespace().next().map(|s| s.to_lowercase())
+                })
+                .collect();
+            Ok(des)
+        }
+        Distro::Debian => {
+            let output = run_command_output(&["tasksel", "--list-tasks"])?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let des = stdout.lines()
+                .filter_map(|line| {
+                    if line.starts_with("i") {
+                        line.split_whitespace().nth(1).map(|s| s.to_lowercase())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            Ok(des)
+        }
+    }
+}
+
+fn install_desktop_packages(distro: &Distro, packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+    println!("{} Installing desktop packages...", "[INFO]".blue());
+    match distro {
+        Distro::Fedora => {
+            let mut cmd: Vec<&str> = vec!["sudo", "dnf", "group", "install", "-y"];
+            for pkg in packages {
+                cmd.push(pkg);
+            }
+            run_command(&cmd, "Installing desktop environment group")?;
+        }
+        Distro::Debian => {
+            let mut cmd: Vec<&str> = vec!["sudo", "tasksel", "install"];
+            for pkg in packages {
+                cmd.push(pkg);
+            }
+            run_command(&cmd, "Installing desktop environment task")?;
+        }
+    }
+    Ok(())
+}
+
+fn setup_gnome(distro: &Distro, config: &GnomeConfig) -> Result<()> {
+    println!("{} Setting up GNOME...", "[INFO]".blue());
+
+    // Install Flatpak apps
+    for app in &config.flatpak_applications {
+        run_command(&["flatpak", "install", "-y", "flathub", &app.id], &format!("Installing {}", app.name.as_ref().unwrap_or(&app.id)))?;
+    }
+
+    // Additional settings
+    for setting in &config.additional_settings {
+        run_command(&["gsettings", "set", &setting.schema, &setting.key, &setting.value], &format!("Setting {} {}", setting.schema, setting.key))?;
+    }
+
+    // Install gnome-extensions-cli
+    install_gnome_extensions_cli(distro)?;
+
+    // Add to PATH if needed
+    let home = dirs::home_dir().unwrap();
+    let bin_path = home.join(".local/bin").to_string_lossy().to_string();
+    if !env::var("PATH")?.contains(&bin_path) {
+        println!("{}", format!("Add {} to PATH in your shell config.", bin_path).yellow());
+    }
+
+    // Install extensions
+    for ext in &config.extensions {
+        run_command(&["gext", "install", &ext.id.to_string()], &format!("Installing extension {}", ext.name))?;
+        if let Some(uuid) = &ext.uuid {
+            run_command(&["gext", "enable", uuid], &format!("Enabling extension {}", ext.name))?;
+        }
+    }
+
+    // Install fallback extension packages
+    install_extension_packages(distro, &config.dnf_extension_packages)?;
+
+    // Enable extensions fallback
+    for uuid in &config.extensions_to_enable {
+        run_command(&["gnome-extensions", "enable", uuid], &format!("Enabling extension {}", uuid))?;
+    }
+
+    Ok(())
+}
+
+fn set_default_desktop_environment(distro: &Distro, de_env: &str) -> Result<()> {
+    println!("{} Setting default desktop environment to {}", "[INFO]".blue(), de_env);
+    match distro {
+        Distro::Fedora => {
+            let session_name = de_env.split('-').next().unwrap_or(de_env);
+            let desktop_file_content = format!("DESKTOP={}", session_name);
+            let cmd = format!("echo '{}' | sudo tee /etc/sysconfig/desktop", desktop_file_content);
+            run_command(&["sh", "-c", &cmd], "Setting default desktop session")?
+        }
+        Distro::Debian => {
+            println!("{}", "Setting the default desktop environment on Debian is not yet implemented.".yellow());
+        }
+    }
     Ok(())
 }
