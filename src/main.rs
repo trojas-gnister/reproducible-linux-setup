@@ -206,7 +206,7 @@ fn main() -> Result<()> {
     }
 
     // Synchronize system packages with installed packages
-    let system_packages = sync_system_packages(args.yes, args.no, args.verbose)?;
+    sync_system_packages(args.yes, args.no, args.verbose)?;
 
     // Desktop Environment Setup
     if let Some(desktop_config) = &config.desktop {
@@ -231,8 +231,23 @@ fn main() -> Result<()> {
 
     // Podman setup
     if let Some(podman) = &config.podman {
-        if system_packages.contains(&"podman".to_string()) {
-            run_command(&["systemctl", "--user", "enable", "--now", "podman.socket"], "Enabling Podman socket")?;
+        // If podman config exists, ensure podman is installed
+        if args.verbose {
+            println!("{} Podman configuration found, ensuring podman is installed", "[DEBUG]".cyan());
+        }
+        
+        // Check if podman is installed, install if not
+        let podman_check = run_command_output(&["which", "podman"]);
+        if podman_check.is_err() {
+            if args.verbose {
+                println!("{} Podman not found, installing it", "[DEBUG]".cyan());
+            }
+            install_system_packages(&config.distro, &["podman".to_string()], args.verbose)?;
+        } else if args.verbose {
+            println!("{} Podman already installed", "[DEBUG]".cyan());
+        }
+        
+        run_command(&["systemctl", "--user", "enable", "--now", "podman.socket"], "Enabling Podman socket")?;
 
             // Configure registries
             let registries_conf = r#"[registries.search]
@@ -307,7 +322,6 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
 
                     println!("{} Successfully started container {}", "[SUCCESS]".green(), cont.name);
                 }
-            }
             }
         }
     }
@@ -755,7 +769,7 @@ fn sync_system_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String
     // Install missing packages
     if !packages_to_install.is_empty() {
         println!("{} Installing {} packages from config...", "[INFO]".blue(), packages_to_install.len());
-        install_system_packages(&Distro::Fedora, &packages_to_install)?;
+        install_system_packages(&Distro::Fedora, &packages_to_install, verbose)?;
     }
     
     // Remove unwanted packages
@@ -859,10 +873,15 @@ fn update_system_packages(_distro: &Distro, verbose: bool) -> Result<()> {
     Ok(())
 }
 
-fn install_system_packages(_distro: &Distro, packages: &[String]) -> Result<()> {
+fn install_system_packages(_distro: &Distro, packages: &[String], verbose: bool) -> Result<()> {
     if packages.is_empty() {
         return Ok(());
     }
+    
+    if verbose {
+        println!("{} Installing {} system packages: {}", "[DEBUG]".cyan(), packages.len(), packages.join(", "));
+    }
+    
     let mut cmd: Vec<&str> = vec!["sudo", "dnf", "install", "-y", "--skip-unavailable"];
     for pkg in packages {
         cmd.push(pkg);
