@@ -1,20 +1,21 @@
 # Reproducible Linux Setup
 
-A powerful Rust-based tool for automating Linux desktop environment setup with support for multiple distributions, containerized applications, and dotfiles management.
+A powerful Rust-based tool for automating Fedora Linux desktop environment setup with containerized applications and dotfiles management.
 
 ## 🚀 Features
 
-- **Multi-Distribution Support**: Fedora (dnf) and Debian/Ubuntu (apt)
+- **Fedora Support**: Optimized for Fedora Linux with dnf package manager
 - **Dotfiles Management**: Safe migration of `.bashrc` and `.config` directories with backups
 - **Container Management**: Simplified Podman container deployment with flexible flag support
-- **Desktop Environment**: GNOME customization with extensions and themes
+- **Desktop Environment**: Desktop environment installation and configuration with display manager setup
 - **VPN Integration**: Automated WireGuard setup with NetworkManager
-- **Custom Commands**: Execute additional shell commands in sequence
+- **Package Management**: Modular system and Flatpak package installation from separate TOML files
+- **Custom Commands**: Execute additional shell commands in sequence with run-once support
 - **Interactive Setup**: User confirmation prompts for safe configuration migration
 
 ## 📋 Requirements
 
-- **Supported OS**: Fedora, Debian, or Ubuntu
+- **Supported OS**: Fedora Linux
 - **Dependencies**: `sudo` access for system modifications
 - **Optional**: Podman for container support
 
@@ -29,29 +30,75 @@ cargo build --release
 
 ### Quick Setup
 ```bash
-# Run with default configuration
+# Generate initial configuration from current system state
+./target/release/repro-setup --initial
+
+# Run with default configuration (uses config/config.toml)
 ./target/release/repro-setup
 
-# Run with custom config
-./target/release/repro-setup --config my-config.toml
+# Run with custom config file
+./target/release/repro-setup --config my-config/config.toml
 ```
 
 ## 📖 Configuration
 
-The setup is controlled via `config.toml`. Here's the structure:
+The setup is controlled via configuration files in the `config/` directory:
 
-### Basic Configuration
+- `config/config.toml` - Main configuration file
+- `config/system-packages.toml` - System packages to install via dnf
+- `config/flatpak-packages.toml` - Flatpak applications to install
+
+### Initial Setup
+
+For first-time setup, use the `--initial` flag to generate package configuration files from your current system:
+
+```bash
+./target/release/repro-setup --initial
+```
+
+This will:
+- Scan your system for user-installed packages using `dnf repoquery --leaves --userinstalled`
+- Scan for installed Flatpak applications using `flatpak list --app`
+- Generate `config/system-packages.toml` and `config/flatpak-packages.toml`
+- Create the `config/` directory structure
+
+After running `--initial`, create your main `config/config.toml` file and run the tool again without the flag.
+
+Here's the structure:
+
+### Main Configuration (config/config.toml)
 ```toml
-# Supported: "fedora", "debian" 
 distro = "fedora"
 
 [system]
-hostname = "my-desktop"
-prefer_dark_theme = true
+hostname = "my-desktop" 
 enable_amd_gpu = false
 enable_rpm_fusion = true
-system_packages = [
-    "git", "curl", "htop", "podman"
+
+[desktop]
+environment = "cosmic-desktop"
+packages = ["cosmic-desktop-apps"]
+display_manager = "gdm"
+```
+
+### System Packages (config/system-packages.toml)
+```toml
+# System packages to install via dnf
+packages = [
+    "podman",
+    "git",
+    "curl", 
+    "htop",
+    "vim",
+    "btop"
+]
+```
+
+### Flatpak Packages (config/flatpak-packages.toml)
+```toml
+# Flatpak applications to install from Flathub
+packages = [
+    "io.gitlab.librewolf-community"
 ]
 ```
 
@@ -61,6 +108,25 @@ system_packages = [
 setup_bashrc = true        # Migrate .bashrc with user confirmation
 setup_config_dirs = true   # Migrate .config subdirectories
 ```
+
+### Desktop Environment Configuration
+```toml
+[desktop]
+# Desktop environment to install and configure
+environment = "cosmic-desktop"  # Options: cosmic-desktop, gnome, kde-plasma, xfce, etc.
+
+# Additional desktop packages to install
+packages = ["cosmic-desktop-apps"]
+
+# Display manager configuration (login screen)
+display_manager = "gdm"  # Options: gdm, lightdm, sddm, cosmic-greeter
+```
+
+**Display Manager Options**:
+- `gdm` - GNOME Display Manager (recommended for COSMIC)
+- `lightdm` - Lightweight display manager
+- `sddm` - Simple Desktop Display Manager (KDE's default)
+- `cosmic-greeter` - Native COSMIC display manager (in development)
 
 ### Container Configuration
 ```toml
@@ -83,26 +149,35 @@ containers = [
 ### Custom Commands
 ```toml
 [custom_commands]
+# Regular commands that run every time
 commands = [
     "mkdir -p $HOME/.local/bin",
     "git config --global user.name 'Your Name'",
     "systemctl --user enable --now podman.socket"
+]
+
+# Commands that only run once (tracked via SHA-256 hash in ~/.config/repro-setup/executed_commands.json)
+run_once = [
+    "curl -o ~/.local/bin/my-script https://example.com/script.sh && chmod +x ~/.local/bin/my-script",
+    "git clone https://github.com/user/dotfiles ~/.dotfiles",
+    "pip install --user some-package"
 ]
 ```
 
 ## 🎯 What Gets Configured
 
 ### System Level
-- ✅ Package updates and installations
+- ✅ Package updates and installations from `config/system-packages.toml`
 - ✅ Hostname configuration  
-- ✅ Additional repositories (RPM Fusion, contrib/non-free)
+- ✅ Additional repositories (RPM Fusion)
 - ✅ AMD GPU drivers (optional)
-- ✅ Flatpak with Flathub
+- ✅ Flatpak with Flathub and package installation from `config/flatpak-packages.toml`
 
 ### Desktop Environment
-- ✅ GNOME theme (dark/light)
-- ✅ Extensions installation and configuration
-- ✅ Custom keybindings and settings
+- ✅ Desktop environment package installation (COSMIC, GNOME, KDE, etc.)
+- ✅ Display manager configuration (GDM, LightDM, SDDM, COSMIC Greeter)
+- ✅ Default session configuration
+- ✅ Additional desktop packages
 - ✅ Flatpak applications
 
 ### Containers
@@ -152,6 +227,7 @@ Once containers are running:
 - **Backup Creation**: Automatically backs up existing configurations
 - **User Confirmation**: Prompts before overwriting files
 - **Distribution Detection**: Warns if config doesn't match detected OS
+- **Hash-based Command Tracking**: Run-once commands tracked via SHA-256 hash to prevent duplicate execution
 - **Error Handling**: Comprehensive error reporting and rollback
 
 ## 🔍 Troubleshooting
@@ -161,8 +237,7 @@ Once containers are running:
 **Permission Errors**
 ```bash
 # Ensure your user has sudo access
-sudo usermod -aG wheel $USER  # Fedora
-sudo usermod -aG sudo $USER   # Debian/Ubuntu
+sudo usermod -aG wheel $USER
 ```
 
 **Container Issues**
@@ -183,29 +258,40 @@ podman logs <container-name>
 
 ## 📝 Configuration Templates
 
-### Minimal Setup
+### Minimal Setup (config/config.toml)
 ```toml
 distro = "fedora"
 [system]
-system_packages = ["git", "curl"]
+hostname = "minimal-setup"
+enable_amd_gpu = false
+enable_rpm_fusion = false
 [dotfiles]
 setup_bashrc = true
 setup_config_dirs = false
 ```
 
-### Full Desktop Environment
+**Minimal System Packages (config/system-packages.toml):**
+```toml
+packages = ["git", "curl"]
+```
+
+**Minimal Flatpak Packages (config/flatpak-packages.toml):**
+```toml
+packages = []
+```
+
+### Full Desktop Environment (config/config.toml)
 ```toml
 distro = "fedora"
 [system]
 hostname = "workstation"
-prefer_dark_theme = true
+enable_amd_gpu = false
 enable_rpm_fusion = true
-system_packages = ["git", "htop", "podman", "gnome-tweaks"]
 
-[gnome]
-extensions = [
-    { id = 3193, name = "Blur my Shell" }
-]
+[desktop]
+environment = "cosmic-desktop"
+packages = ["cosmic-desktop-apps"]
+display_manager = "gdm"  # Recommended for COSMIC
 
 [dotfiles]
 setup_bashrc = true
@@ -216,6 +302,27 @@ commands = [
     "git config --global user.name 'Dev User'",
     "mkdir -p $HOME/workspace"
 ]
+run_once = [
+    "curl -fsSL https://get.docker.com | sh",
+    "pip install --user pipx"
+]
+```
+
+**Full System Packages (config/system-packages.toml):**
+```toml
+packages = [
+    "git", "htop", "podman", "vim", "curl", "wget",
+    "gnome-tweaks", "dconf-editor", "virt-manager"
+]
+```
+
+**Full Flatpak Packages (config/flatpak-packages.toml):**
+```toml
+packages = [
+    "io.gitlab.librewolf-community",
+    "org.mozilla.firefox", 
+    "org.libreoffice.LibreOffice"
+]
 ```
 
 ## 🤝 Contributing
@@ -223,7 +330,7 @@ commands = [
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Test on both Fedora and Debian/Ubuntu
+4. Test on Fedora
 5. Submit a pull request
 
 ## 📄 License
@@ -234,7 +341,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - Check the [Issues](../../issues) page for known problems
 - Review `CLAUDE.md` for development notes
-- Ensure your distribution is supported (Fedora/Debian/Ubuntu)
+- Ensure you're running Fedora Linux
 
 ---
 
