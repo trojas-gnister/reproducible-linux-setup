@@ -36,9 +36,32 @@ cargo build --release
 # Run with default configuration (uses config/config.toml)
 ./target/release/repro-setup
 
+# Run with verbose logging for detailed output
+./target/release/repro-setup --verbose
+
+# Auto-answer yes to all prompts (unattended mode)
+./target/release/repro-setup --yes
+
+# Auto-answer no to all prompts (safe mode)
+./target/release/repro-setup --no
+
 # Run with custom config file
 ./target/release/repro-setup --config my-config/config.toml
 ```
+
+## 🎛️ CLI Options
+
+| Flag | Description |
+|------|-------------|
+| `--initial` | Generate initial configuration files from current system state |
+| `--config <path>` | Use custom configuration file (default: `config/config.toml`) |
+| `--verbose, -v` | Enable verbose logging for detailed output |
+| `--yes, -y` | Automatically answer yes to all prompts (unattended mode) |
+| `--no, -n` | Automatically answer no to all prompts (safe mode) |
+| `--help, -h` | Show help information |
+| `--version` | Show version information |
+
+**Note**: `--yes` and `--no` flags cannot be used together.
 
 ## 📖 Configuration
 
@@ -79,6 +102,15 @@ enable_rpm_fusion = true
 environment = "cosmic-desktop"
 packages = ["cosmic-desktop-apps"]
 display_manager = "gdm"
+
+[flatpak]
+[[flatpak.remotes]]
+name = "flathub"
+url = "https://flathub.org/repo/flathub.flatpakrepo"
+
+[[flatpak.remotes]]
+name = "flathub-beta"
+url = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo"
 ```
 
 ### System Packages (config/system-packages.toml)
@@ -94,11 +126,26 @@ packages = [
 ]
 ```
 
-### Flatpak Packages (config/flatpak-packages.toml)
+### Flatpak Configuration
+
+#### Main Config (config/config.toml)
 ```toml
-# Flatpak applications to install from Flathub
+[flatpak]
+[[flatpak.remotes]]
+name = "flathub"
+url = "https://flathub.org/repo/flathub.flatpakrepo"
+
+[[flatpak.remotes]]
+name = "flathub-beta"
+url = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo"
+```
+
+#### Packages (config/flatpak-packages.toml)
+```toml
+# Flatpak applications to install
 packages = [
-    "io.gitlab.librewolf-community"
+    "io.gitlab.librewolf-community",          # From flathub (default)
+    "flathub-beta:com.valvesoftware.Steam"    # From flathub-beta (specify remote)
 ]
 ```
 
