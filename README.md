@@ -399,6 +399,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - Fix Podman Autostart functionality
 - Fix VPN
 - Keep containers up to date
+- Support for building and managing locally built podman containers
 - Integrate VM generation
 - Cosmic Desktop management using config.toml
 - Integrate WinApps Docker or Bottles
