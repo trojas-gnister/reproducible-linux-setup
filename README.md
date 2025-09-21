@@ -94,7 +94,7 @@ Here's the structure:
 distro = "fedora"
 
 [system]
-hostname = "my-desktop" 
+hostname = "my-desktop"
 enable_amd_gpu = false
 enable_rpm_fusion = true
 
@@ -119,7 +119,7 @@ url = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo"
 packages = [
     "podman",
     "git",
-    "curl", 
+    "curl",
     "htop",
     "vim",
     "btop"
@@ -180,12 +180,12 @@ display_manager = "gdm"  # Options: gdm, lightdm, sddm, cosmic-greeter
 [podman]
 containers = [
     # Brave Browser
-    { name = "brave", 
-      image = "lscr.io/linuxserver/brave:latest", 
+    { name = "brave",
+      image = "lscr.io/linuxserver/brave:latest",
       raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -e PGID=1000 -p 3100:3000 -p 3101:3001 -v $HOME/.config/brave:/config --shm-size=1gb --restart unless-stopped",
       auto_start = true },
-    
-    # Librewolf Browser  
+
+    # Librewolf Browser
     { name = "librewolf",
       image = "lscr.io/linuxserver/librewolf:latest",
       raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -e PGID=1000 -p 3000:3000 -p 3001:3001 -v $HOME/.config/librewolf:/config --shm-size=1gb --restart unless-stopped",
@@ -215,7 +215,7 @@ run_once = [
 
 ### System Level
 - ✅ Package updates and installations from `config/system-packages.toml`
-- ✅ Hostname configuration  
+- ✅ Hostname configuration
 - ✅ Additional repositories (RPM Fusion)
 - ✅ AMD GPU drivers (optional)
 - ✅ Flatpak with Flathub and package installation from `config/flatpak-packages.toml`
@@ -266,7 +266,7 @@ run_once = [
 Once containers are running:
 
 - **Brave Browser**: http://localhost:3100 or https://localhost:3101
-- **Librewolf Browser**: http://localhost:3000 or https://localhost:3001  
+- **Librewolf Browser**: http://localhost:3000 or https://localhost:3001
 - **Ollama API**: http://localhost:11434 (if enabled)
 
 ## 🛡️ Safety Features
@@ -367,7 +367,7 @@ packages = [
 ```toml
 packages = [
     "io.gitlab.librewolf-community",
-    "org.mozilla.firefox", 
+    "org.mozilla.firefox",
     "org.libreoffice.LibreOffice"
 ]
 ```
@@ -393,3 +393,13 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ---
 
 **Note**: This tool modifies system configurations. Always review the `config.toml` before running and ensure you have backups of important data.
+
+## TODO
+- System update
+- Fix Podman Autostart functionality
+- Fix VPN
+- Keep containers up to date
+- Integrate VM generation
+- Cosmic Desktop management using config.toml
+- Integrate WinApps Docker or Bottles
+- Optimize

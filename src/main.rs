@@ -17,19 +17,19 @@ struct Args {
     /// Path to the configuration file (TOML format)
     #[arg(long, default_value = "config/config.toml")]
     config: String,
-    
+
     /// Generate initial configuration files from current system state
     #[arg(long)]
     initial: bool,
-    
+
     /// Enable verbose logging for detailed output
     #[arg(short, long)]
     verbose: bool,
-    
+
     /// Automatically answer yes to all prompts
     #[arg(short = 'y', long)]
     yes: bool,
-    
+
     /// Automatically answer no to all prompts
     #[arg(short = 'n', long)]
     no: bool,
@@ -135,44 +135,44 @@ struct PackageList {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    
+
     // Validate flag conflicts
     if args.yes && args.no {
         anyhow::bail!("Cannot specify both --yes and --no flags");
     }
-    
+
     if args.verbose {
         println!("{} Verbose mode enabled", "[DEBUG]".cyan());
         println!("{} Command line arguments: {:?}", "[DEBUG]".cyan(), args);
     }
-    
+
     // Handle --initial flag to generate package config files from current system state
     if args.initial {
         println!("{} Generating package configuration from current system state...", "[INFO]".blue());
-        
+
         if args.verbose {
             println!("{} Creating config directory if it doesn't exist", "[DEBUG]".cyan());
         }
         // Create config directory if it doesn't exist
         fs::create_dir_all("config")
             .with_context(|| "Failed to create config directory")?;
-        
+
         // Generate system packages config
         let system_packages = get_user_installed_packages()?;
         update_system_packages_file(&system_packages)?;
-        
-        // Generate flatpak packages config  
+
+        // Generate flatpak packages config
         let flatpak_packages = get_installed_flatpaks().unwrap_or_else(|_| {
             println!("{} Flatpak not available or no applications installed", "[WARN]".yellow());
             Vec::new()
         });
         update_flatpak_packages_file(&flatpak_packages)?;
-        
+
         println!("{} Package configuration files generated successfully!", "[SUCCESS]".green());
         println!("Now create your main config/config.toml file and run again without --initial");
         return Ok(());
     }
-    
+
     println!("🚀 Starting Desktop environment setup...");
 
     let config_content = fs::read_to_string(&args.config)
@@ -183,9 +183,9 @@ fn main() -> Result<()> {
     // Check if running on the correct distro
     let os_release = fs::read_to_string("/etc/os-release")?;
     let detected_distro = detect_distro(&os_release)?;
-    
+
     if detected_distro != config.distro {
-        println!("{}", format!("Warning: Configuration is for {:?} but detected {:?}. Continuing...", 
+        println!("{}", format!("Warning: Configuration is for {:?} but detected {:?}. Continuing...",
                               config.distro, detected_distro).yellow());
     }
 
@@ -225,7 +225,7 @@ fn main() -> Result<()> {
 
     // Flatpak setup
     setup_flatpak(&config.distro, config.flatpak.as_ref(), args.verbose)?;
-    
+
     // Synchronize Flatpak packages with installed applications
     let _flatpak_packages = sync_flatpak_packages(args.yes, args.no, args.verbose)?;
 
@@ -235,7 +235,7 @@ fn main() -> Result<()> {
         if args.verbose {
             println!("{} Podman configuration found, ensuring podman is installed", "[DEBUG]".cyan());
         }
-        
+
         // Check if podman is installed, install if not
         let podman_check = run_command_output(&["which", "podman"]);
         if podman_check.is_err() {
@@ -246,7 +246,7 @@ fn main() -> Result<()> {
         } else if args.verbose {
             println!("{} Podman already installed", "[DEBUG]".cyan());
         }
-        
+
         run_command(&["systemctl", "--user", "enable", "--now", "podman.socket"], "Enabling Podman socket")?;
 
             // Configure registries
@@ -283,6 +283,7 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
             // Pull and start containers
             if let Some(containers) = &podman.containers {
                 for cont in containers {
+
                 let container_exists = std::io::Cursor::new(Command::new("podman").args(&["ps", "-a", "--format", "{{.Names}}"]).output()?.stdout).lines().any(|line| line.unwrap_or_default() == cont.name);
 
                 if container_exists {
@@ -294,17 +295,15 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
                     }
                 }
 
-                run_command(&["podman", "pull", &cont.image], &format!("Pulling container {}", cont.name))?;
-
                 if cont.auto_start {
                     let mut command = format!("podman run -d --name={} --label managed-by=repro-setup", cont.name);
-                    
+
                     if let Some(flags) = &cont.raw_flags {
                         let replaced_flags = flags.replace("$HOME", home_path);
                         command.push(' ');
                         command.push_str(&replaced_flags);
                     }
-                    
+
                     command.push(' ');
                     command.push_str(&cont.image);
 
@@ -426,20 +425,20 @@ fn run_command_output(cmd: &[&str]) -> Result<Output> {
 
 fn setup_dotfiles(config: &DotfilesConfig, yes: bool, no: bool, verbose: bool) -> Result<()> {
     println!("{} Setting up dotfiles...", "[INFO]".blue());
-    
+
     let current_dir = env::current_dir()?;
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
-    
+
     // Setup .bashrc
     if config.setup_bashrc {
         setup_bashrc(&current_dir, &home_dir, yes, no, verbose)?;
     }
-    
+
     // Setup .config directories
     if config.setup_config_dirs {
         setup_config_dirs(&current_dir, &home_dir, yes, no, verbose)?;
     }
-    
+
     println!("{} Dotfiles setup completed!", "[SUCCESS]".green());
     Ok(())
 }
@@ -447,12 +446,12 @@ fn setup_dotfiles(config: &DotfilesConfig, yes: bool, no: bool, verbose: bool) -
 fn setup_bashrc(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbose: bool) -> Result<()> {
     let project_bashrc = project_dir.join(".bashrc");
     let home_bashrc = home_dir.join(".bashrc");
-    
+
     if !project_bashrc.exists() {
         println!("{} No .bashrc found in project directory, skipping", "[WARN]".yellow());
         return Ok(());
     }
-    
+
     if home_bashrc.exists() {
         println!("{} Found existing .bashrc in home directory", "[INFO]".blue());
         if ask_user_confirmation("Do you want to replace your existing .bashrc with the one from this project?", yes, no, verbose)? {
@@ -461,7 +460,7 @@ fn setup_bashrc(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbos
             fs::copy(&home_bashrc, &backup_path)
                 .context("Failed to backup existing .bashrc")?;
             println!("{} Backed up existing .bashrc to .bashrc.backup", "[INFO]".blue());
-            
+
             // Copy project .bashrc
             fs::copy(&project_bashrc, &home_bashrc)
                 .context("Failed to copy project .bashrc")?;
@@ -475,38 +474,38 @@ fn setup_bashrc(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbos
             .context("Failed to copy .bashrc from project")?;
         println!("{} Successfully installed .bashrc", "[SUCCESS]".green());
     }
-    
+
     Ok(())
 }
 
 fn setup_config_dirs(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbose: bool) -> Result<()> {
     let project_config = project_dir.join(".config");
     let home_config = home_dir.join(".config");
-    
+
     if !project_config.exists() {
         println!("{} No .config directory found in project, skipping", "[WARN]".yellow());
         return Ok(());
     }
-    
+
     // Create ~/.config if it doesn't exist
     fs::create_dir_all(&home_config)
         .context("Failed to create ~/.config directory")?;
-    
+
     // Process each subdirectory in project .config
     for entry in fs::read_dir(&project_config)? {
         let entry = entry?;
         let path = entry.path();
-        
+
         if path.is_dir() {
             let dir_name = path.file_name()
                 .context("Invalid directory name")?
                 .to_str()
                 .context("Non-UTF8 directory name")?;
-            
+
             let target_dir = home_config.join(dir_name);
-            
+
             println!("{} Processing config directory: {}", "[INFO]".blue(), dir_name);
-            
+
             if target_dir.exists() {
                 println!("{} Found existing {} config directory", "[INFO]".blue(), dir_name);
                 if ask_user_confirmation(&format!("Do you want to replace your existing {} config with the one from this project?", dir_name), yes, no, verbose)? {
@@ -518,7 +517,7 @@ fn setup_config_dirs(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, v
                     fs::rename(&target_dir, &backup_path)
                         .with_context(|| format!("Failed to backup existing {} config", dir_name))?;
                     println!("{} Backed up existing {} config to {}.backup", "[INFO]".blue(), dir_name, dir_name);
-                    
+
                     // Copy project config
                     copy_dir_all(&path, &target_dir)
                         .with_context(|| format!("Failed to copy {} config from project", dir_name))?;
@@ -534,7 +533,7 @@ fn setup_config_dirs(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, v
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -546,7 +545,7 @@ fn ask_user_confirmation(prompt: &str, yes: bool, no: bool, verbose: bool) -> Re
         println!("{} (y/n): y", prompt);
         return Ok(true);
     }
-    
+
     if no {
         if verbose {
             println!("{} Auto-answering NO: {}", "[DEBUG]".cyan(), prompt);
@@ -554,14 +553,14 @@ fn ask_user_confirmation(prompt: &str, yes: bool, no: bool, verbose: bool) -> Re
         println!("{} (y/n): n", prompt);
         return Ok(false);
     }
-    
+
     loop {
         print!("{} (y/n): ", prompt);
         io::stdout().flush()?;
-        
+
         let mut input = String::new();
         io::stdin().read_line(&mut input)?;
-        
+
         match input.trim().to_lowercase().as_str() {
             "y" | "yes" => return Ok(true),
             "n" | "no" => return Ok(false),
@@ -607,7 +606,7 @@ fn get_state_file_path() -> Result<std::path::PathBuf> {
 
 fn load_executed_commands_state() -> Result<ExecutedCommandsState> {
     let state_file = get_state_file_path()?;
-    
+
     if state_file.exists() {
         let content = fs::read_to_string(&state_file)
             .context("Failed to read executed commands state file")?;
@@ -633,7 +632,7 @@ fn load_package_list(file_path: &str) -> Result<Vec<String>> {
         println!("{} Package file {} not found, skipping", "[WARN]".yellow(), file_path);
         return Ok(Vec::new());
     }
-    
+
     let content = fs::read_to_string(file_path)
         .context(format!("Failed to read package file: {}", file_path))?;
     let package_list: PackageList = toml::from_str(&content)
@@ -643,54 +642,54 @@ fn load_package_list(file_path: &str) -> Result<Vec<String>> {
 
 fn get_user_installed_packages() -> Result<Vec<String>> {
     println!("{} Getting list of user-installed packages...", "[INFO]".blue());
-    
+
     let output = Command::new("dnf")
         .args(&["repoquery", "--leaves", "--userinstalled", "--qf", "%{name}\\n"])
         .output()
         .context("Failed to run dnf repoquery command")?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("dnf repoquery failed: {}", stderr);
     }
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut packages: Vec<String> = stdout
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty())
         .collect();
-    
+
     packages.sort();
     packages.dedup();
-    
+
     println!("{} Found {} user-installed packages", "[INFO]".blue(), packages.len());
     Ok(packages)
 }
 
 fn get_installed_flatpaks() -> Result<Vec<String>> {
     println!("{} Getting list of installed Flatpak applications...", "[INFO]".blue());
-    
+
     let output = Command::new("flatpak")
         .args(&["list", "--app", "--columns=application"])
         .output()
         .context("Failed to run flatpak list command")?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("flatpak list failed: {}", stderr);
     }
-    
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut apps: Vec<String> = stdout
         .lines()
         .map(|line| line.trim().to_string())
         .filter(|line| !line.is_empty() && line != "Application ID") // Skip header
         .collect();
-    
+
     apps.sort();
     apps.dedup();
-    
+
     println!("{} Found {} installed Flatpak applications", "[INFO]".blue(), apps.len());
     Ok(apps)
 }
@@ -699,14 +698,14 @@ fn update_system_packages_file(packages: &[String]) -> Result<()> {
     let package_list = PackageList {
         packages: packages.to_vec(),
     };
-    
-    let content = format!("# System packages to install via dnf\n{}", 
+
+    let content = format!("# System packages to install via dnf\n{}",
         toml::to_string_pretty(&package_list)
         .context("Failed to serialize package list to TOML")?);
-    
+
     fs::write("config/system-packages.toml", content)
         .context("Failed to write system-packages.toml file")?;
-    
+
     println!("{} Updated config/system-packages.toml with {} packages", "[SUCCESS]".green(), packages.len());
     Ok(())
 }
@@ -715,33 +714,33 @@ fn update_flatpak_packages_file(packages: &[String]) -> Result<()> {
     let package_list = PackageList {
         packages: packages.to_vec(),
     };
-    
-    let content = format!("# Flatpak applications to install from Flathub\n{}", 
+
+    let content = format!("# Flatpak applications to install from Flathub\n{}",
         toml::to_string_pretty(&package_list)
         .context("Failed to serialize flatpak list to TOML")?);
-    
+
     fs::write("config/flatpak-packages.toml", content)
         .context("Failed to write flatpak-packages.toml file")?;
-    
+
     println!("{} Updated config/flatpak-packages.toml with {} applications", "[SUCCESS]".green(), packages.len());
     Ok(())
 }
 
 fn sync_system_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String>> {
     println!("{} Synchronizing system packages with installed packages...", "[INFO]".blue());
-    
+
     // Get currently installed user packages
     let installed_packages = get_user_installed_packages()?;
     if verbose {
         println!("{} Found {} installed packages", "[DEBUG]".cyan(), installed_packages.len());
     }
-    
+
     // Load packages from config file
     let mut config_packages = load_package_list("config/system-packages.toml")?;
     if verbose {
         println!("{} Loaded {} packages from config", "[DEBUG]".cyan(), config_packages.len());
     }
-    
+
     // Find packages to install (in config but not installed)
     let mut packages_to_install = Vec::new();
     for pkg in &config_packages {
@@ -749,11 +748,11 @@ fn sync_system_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String
             packages_to_install.push(pkg.clone());
         }
     }
-    
+
     // Find packages to potentially remove (installed but not in config)
     let mut packages_to_keep = Vec::new();
     let mut packages_to_remove = Vec::new();
-    
+
     for pkg in &installed_packages {
         if !config_packages.contains(pkg) {
             println!("\n{} Package '{}' is installed but not in system-packages.toml", "[INFO]".yellow(), pkg);
@@ -765,13 +764,13 @@ fn sync_system_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String
             }
         }
     }
-    
+
     // Install missing packages
     if !packages_to_install.is_empty() {
         println!("{} Installing {} packages from config...", "[INFO]".blue(), packages_to_install.len());
         install_system_packages(&Distro::Fedora, &packages_to_install, verbose)?;
     }
-    
+
     // Remove unwanted packages
     if !packages_to_remove.is_empty() {
         println!("{} Removing {} unwanted packages...", "[INFO]".blue(), packages_to_remove.len());
@@ -779,31 +778,31 @@ fn sync_system_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String
             run_command(&["sudo", "dnf", "remove", "-y", pkg], &format!("Removing package {}", pkg))?;
         }
     }
-    
+
     // Update config file if there were changes
     if !packages_to_keep.is_empty() || !packages_to_remove.is_empty() {
         config_packages.sort();
         config_packages.dedup();
         update_system_packages_file(&config_packages)?;
     }
-    
+
     println!("{} Package synchronization completed", "[SUCCESS]".green());
     println!("  - Installed: {} packages", packages_to_install.len());
-    println!("  - Kept: {} packages", packages_to_keep.len()); 
+    println!("  - Kept: {} packages", packages_to_keep.len());
     println!("  - Removed: {} packages", packages_to_remove.len());
-    
+
     Ok(config_packages)
 }
 
 fn sync_flatpak_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String>> {
     println!("{} Synchronizing Flatpak packages with installed applications...", "[INFO]".blue());
-    
+
     // Get currently installed Flatpak applications
     let installed_flatpaks = get_installed_flatpaks()?;
-    
+
     // Load packages from config file
     let mut config_flatpaks = load_package_list("config/flatpak-packages.toml")?;
-    
+
     // Find packages to install (in config but not installed)
     let mut flatpaks_to_install = Vec::new();
     for app in &config_flatpaks {
@@ -811,11 +810,11 @@ fn sync_flatpak_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<Strin
             flatpaks_to_install.push(app.clone());
         }
     }
-    
+
     // Find packages to potentially remove (installed but not in config)
     let mut flatpaks_to_keep = Vec::new();
     let mut flatpaks_to_remove = Vec::new();
-    
+
     for app in &installed_flatpaks {
         if !config_flatpaks.contains(app) {
             println!("\n{} Flatpak application '{}' is installed but not in flatpak-packages.toml", "[INFO]".yellow(), app);
@@ -827,13 +826,13 @@ fn sync_flatpak_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<Strin
             }
         }
     }
-    
+
     // Install missing Flatpak applications
     if !flatpaks_to_install.is_empty() {
         println!("{} Installing {} Flatpak applications from config...", "[INFO]".blue(), flatpaks_to_install.len());
         install_flatpak_packages(&flatpaks_to_install)?;
     }
-    
+
     // Remove unwanted Flatpak applications
     if !flatpaks_to_remove.is_empty() {
         println!("{} Removing {} unwanted Flatpak applications...", "[INFO]".blue(), flatpaks_to_remove.len());
@@ -841,19 +840,19 @@ fn sync_flatpak_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<Strin
             run_command(&["flatpak", "uninstall", "-y", app], &format!("Removing Flatpak application {}", app))?;
         }
     }
-    
+
     // Update config file if there were changes
     if !flatpaks_to_keep.is_empty() || !flatpaks_to_remove.is_empty() {
         config_flatpaks.sort();
         config_flatpaks.dedup();
         update_flatpak_packages_file(&config_flatpaks)?;
     }
-    
+
     println!("{} Flatpak synchronization completed", "[SUCCESS]".green());
     println!("  - Installed: {} applications", flatpaks_to_install.len());
-    println!("  - Kept: {} applications", flatpaks_to_keep.len()); 
+    println!("  - Kept: {} applications", flatpaks_to_keep.len());
     println!("  - Removed: {} applications", flatpaks_to_remove.len());
-    
+
     Ok(config_flatpaks)
 }
 
@@ -877,11 +876,11 @@ fn install_system_packages(_distro: &Distro, packages: &[String], verbose: bool)
     if packages.is_empty() {
         return Ok(());
     }
-    
+
     if verbose {
         println!("{} Installing {} system packages: {}", "[DEBUG]".cyan(), packages.len(), packages.join(", "));
     }
-    
+
     let mut cmd: Vec<&str> = vec!["sudo", "dnf", "install", "-y", "--skip-unavailable"];
     for pkg in packages {
         cmd.push(pkg);
@@ -891,13 +890,25 @@ fn install_system_packages(_distro: &Distro, packages: &[String], verbose: bool)
 }
 
 fn enable_additional_repos(_distro: &Distro) -> Result<()> {
-    run_command(&["sudo", "dnf", "install", "-y", "https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm", "https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm"], "Enabling RPM Fusion")?;
+    let output = std::process::Command::new("rpm")
+        .args(["-E", "%fedora"])
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to get Fedora version: {}", e))?;
+
+    let fedora_version = String::from_utf8(output.stdout)
+        .map_err(|e| anyhow::anyhow!("Invalid UTF-8 format: {}", e))?
+        .trim()
+        .to_string();
+
+    let rpmfusion_url = format!("https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-{}.noarch.rpm", fedora_version);
+
+    run_command(&["sudo", "dnf", "install", "-y", &rpmfusion_url], "Enabling RPM Fusion")?;
     Ok(())
 }
 
 fn setup_amd_gpu(_distro: &Distro) -> Result<()> {
     run_command(&["sudo", "dnf", "install", "-y", "--skip-unavailable", "rocm-opencl", "rocm-clinfo", "mesa-dri-drivers"], "Installing ROCm and AMD drivers")?;
-    
+
     // Common GPU setup
     run_command(&["sudo", "usermod", "-aG", "render", &env::var("USER")?], "Adding user to render group")?;
     let udev_content = r#"KERNEL=="kfd", GROUP="render", MODE="0666"
@@ -907,7 +918,7 @@ SUBSYSTEM=="drm", GROUP="render", MODE="0666""#;
     run_command(&["sudo", "udevadm", "control", "--reload-rules"], "Reloading udev rules")?;
     run_command(&["sudo", "udevadm", "trigger"], "Triggering udev")?;
     println!("{}", "Reboot recommended for AMD GPU.".yellow());
-    
+
     Ok(())
 }
 
@@ -915,15 +926,15 @@ fn setup_flatpak(_distro: &Distro, flatpak_config: Option<&FlatpakConfig>, verbo
     if verbose {
         println!("{} Installing Flatpak and setting up remotes", "[DEBUG]".cyan());
     }
-    
+
     run_command(&["sudo", "dnf", "install", "-y", "--skip-unavailable", "flatpak"], "Installing Flatpak")?;
-    
+
     // Add default Flathub if no custom config is provided
     if flatpak_config.is_none() {
         run_command(&["flatpak", "remote-add", "--if-not-exists", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"], "Adding Flathub")?;
         return Ok(());
     }
-    
+
     // Add configured remotes
     if let Some(config) = flatpak_config {
         if let Some(remotes) = &config.remotes {
@@ -931,12 +942,12 @@ fn setup_flatpak(_distro: &Distro, flatpak_config: Option<&FlatpakConfig>, verbo
                 if verbose {
                     println!("{} Adding Flatpak remote: {} -> {}", "[DEBUG]".cyan(), remote.name, remote.url);
                 }
-                run_command(&["flatpak", "remote-add", "--if-not-exists", &remote.name, &remote.url], 
+                run_command(&["flatpak", "remote-add", "--if-not-exists", &remote.name, &remote.url],
                           &format!("Adding Flatpak remote {}", remote.name))?;
             }
         }
     }
-    
+
     Ok(())
 }
 
@@ -945,15 +956,15 @@ fn install_flatpak_packages(packages: &[String]) -> Result<()> {
     if packages.is_empty() {
         return Ok(());
     }
-    
+
     println!("{} Installing Flatpak applications...", "[INFO]".blue());
-    
+
     for package in packages {
         let (remote, app_id) = parse_flatpak_package(package);
         println!("{} Installing Flatpak package: {} from {}", "[INFO]".blue(), app_id, remote);
         run_command(&["flatpak", "install", "-y", remote, app_id], &format!("Installing {} from {}", app_id, remote))?;
     }
-    
+
     println!("{} All Flatpak packages installed successfully!", "[SUCCESS]".green());
     Ok(())
 }
@@ -980,42 +991,42 @@ fn execute_custom_commands(config: &CustomCommandsConfig, verbose: bool) -> Resu
     if config.commands.is_empty() && config.run_once.as_ref().map_or(true, |v| v.is_empty()) {
         return Ok(());
     }
-    
+
     println!("{} Executing custom commands...", "[INFO]".blue());
-    
+
     // Load state for run_once commands
     let mut state = load_executed_commands_state()?;
     let mut state_changed = false;
-    
+
     // Execute regular commands
     for (index, command) in config.commands.iter().enumerate() {
-        println!("{} Executing command {} of {}: {}", 
+        println!("{} Executing command {} of {}: {}",
                 "[INFO]".blue(), index + 1, config.commands.len(), command);
-        
+
         execute_single_command(command)?;
         println!("{} Command completed successfully", "[SUCCESS]".green());
     }
-    
+
     // Execute run_once commands
     if let Some(run_once_commands) = &config.run_once {
         for (index, command) in run_once_commands.iter().enumerate() {
             let command_hash = generate_command_hash(command);
-            
+
             if verbose {
                 println!("{} Command hash: {} for: {}", "[DEBUG]".cyan(), &command_hash[..8], command);
             }
-            
+
             if state.executed_once_commands.contains_key(&command_hash) {
-                println!("{} Skipping run-once command {} of {} (already executed): {}", 
+                println!("{} Skipping run-once command {} of {} (already executed): {}",
                         "[INFO]".blue(), index + 1, run_once_commands.len(), command);
                 continue;
             }
-            
-            println!("{} Executing run-once command {} of {}: {}", 
+
+            println!("{} Executing run-once command {} of {}: {}",
                     "[INFO]".blue(), index + 1, run_once_commands.len(), command);
-            
+
             execute_single_command(command)?;
-            
+
             // Mark command as executed with metadata
             let execution_record = CommandExecutionRecord {
                 command_hash: command_hash.clone(),
@@ -1024,16 +1035,16 @@ fn execute_custom_commands(config: &CustomCommandsConfig, verbose: bool) -> Resu
             };
             state.executed_once_commands.insert(command_hash, execution_record);
             state_changed = true;
-            
+
             println!("{} Run-once command completed successfully", "[SUCCESS]".green());
         }
     }
-    
+
     // Save state if it changed
     if state_changed {
         save_executed_commands_state(&state)?;
     }
-    
+
     println!("{} All custom commands executed successfully!", "[SUCCESS]".green());
     Ok(())
 }
@@ -1045,20 +1056,20 @@ fn execute_single_command(command: &str) -> Result<()> {
         .arg(command)
         .output()
         .with_context(|| format!("Failed to execute command: {}", command))?;
-    
+
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         println!("{} Command failed: {}", "[ERROR]".red(), command);
         println!("{} Error output: {}", "[ERROR]".red(), stderr);
         anyhow::bail!("Custom command failed: {}", command);
     }
-    
+
     // Show stdout if there's any output
     let stdout = String::from_utf8_lossy(&output.stdout);
     if !stdout.trim().is_empty() {
         println!("{} Output: {}", "[INFO]".blue(), stdout.trim());
     }
-    
+
     Ok(())
 }
 
@@ -1132,7 +1143,7 @@ fn set_default_desktop_environment(_distro: &Distro, de_env: &str) -> Result<()>
 
 fn setup_display_manager(_distro: &Distro, display_manager: &str) -> Result<()> {
     println!("{} Setting up display manager: {}", "[INFO]".blue(), display_manager);
-    
+
     // Install the display manager package
     let dm_package = match display_manager {
         "gdm" => "gdm",
@@ -1144,29 +1155,29 @@ fn setup_display_manager(_distro: &Distro, display_manager: &str) -> Result<()> 
             return Ok(());
         }
     };
-    
+
     // Install the display manager
     run_command(&["sudo", "dnf", "install", "-y", "--skip-unavailable", dm_package], &format!("Installing {}", dm_package))?;
-    
+
     // Disable current display manager
     let _ = run_command(&["sudo", "systemctl", "disable", "gdm"], "Disabling GDM");
     let _ = run_command(&["sudo", "systemctl", "disable", "lightdm"], "Disabling LightDM");
     let _ = run_command(&["sudo", "systemctl", "disable", "sddm"], "Disabling SDDM");
     let _ = run_command(&["sudo", "systemctl", "disable", "cosmic-greeter"], "Disabling COSMIC Greeter");
-    
+
     // Enable the selected display manager
     let service_name = match display_manager {
         "cosmic-greeter" => "cosmic-greeter",
         _ => display_manager,
     };
-    
+
     run_command(&["sudo", "systemctl", "enable", service_name], &format!("Enabling {}", service_name))?;
-    
+
     // Set as default display manager
     run_command(&["sudo", "systemctl", "set-default", "graphical.target"], "Setting graphical target as default")?;
-    
+
     println!("{} Display manager {} configured successfully", "[SUCCESS]".green(), display_manager);
     println!("{} Reboot required for display manager changes to take effect", "[INFO]".yellow());
-    
+
     Ok(())
 }
