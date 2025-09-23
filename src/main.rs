@@ -33,6 +33,18 @@ struct Args {
     /// Automatically answer no to all prompts
     #[arg(short = 'n', long)]
     no: bool,
+
+    /// Force recreation of all containers
+    #[arg(long)]
+    force_recreate: bool,
+
+    /// Update container images and recreate if changed
+    #[arg(long)]
+    update_images: bool,
+
+    /// Never recreate containers (config/systemd only)
+    #[arg(long)]
+    no_recreate: bool,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]
@@ -45,10 +57,11 @@ enum Distro {
 struct Config {
     distro: Distro,
     system: SystemConfig,
+    drives: Option<Vec<DriveConfig>>,
     desktop: Option<DesktopConfig>,
     flatpak: Option<FlatpakConfig>,
     podman: Option<PodmanConfig>,
-    wireguard: Option<WireguardConfig>,
+    vpn: Option<VpnConfig>,
     dotfiles: Option<DotfilesConfig>,
     custom_commands: Option<CustomCommandsConfig>,
 }
@@ -95,19 +108,52 @@ struct Container {
     name: String,
     image: String,
     raw_flags: Option<String>,
-    auto_start: bool,
+    start_after_creation: bool,
+    autostart: Option<bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct ContainerState {
+    containers: HashMap<String, ContainerInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct ContainerInfo {
+    config_hash: String,
+    image_hash: Option<String>,
+    last_updated: u64,
+    managed: bool,
 }
 
 
 #[derive(Deserialize, Debug)]
-struct WireguardConfig {
+struct VpnConfig {
+    #[serde(rename = "type")]
+    vpn_type: VpnType,
     conf_path: String,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum VpnType {
+    Wireguard,
+    Openvpn,
 }
 
 #[derive(Deserialize, Debug)]
 struct DotfilesConfig {
     setup_bashrc: bool,
     setup_config_dirs: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct DriveConfig {
+    device: String,
+    mount_point: String,
+    encrypted: bool,
+    filesystem: Option<String>,
+    label: Option<String>,
+    force_update: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -205,6 +251,11 @@ fn main() -> Result<()> {
         }
     }
 
+    // Setup drives early as other components may depend on them
+    if let Some(drives) = &config.drives {
+        setup_drives(drives, args.verbose)?;
+    }
+
     // Synchronize system packages with installed packages
     sync_system_packages(args.yes, args.no, args.verbose)?;
 
@@ -280,97 +331,18 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
                 }
             }
 
-            // Pull and start containers
+            // Smart container lifecycle management
             if let Some(containers) = &podman.containers {
-                for cont in containers {
-
-                let container_exists = std::io::Cursor::new(Command::new("podman").args(&["ps", "-a", "--format", "{{.Names}}"]).output()?.stdout).lines().any(|line| line.unwrap_or_default() == cont.name);
-
-                if container_exists {
-                    if ask_user_confirmation(&format!("Container '{}' already exists. Do you want to replace it?", cont.name), false, false, false)? {
-                        run_command(&["podman", "rm", "-f", &cont.name], &format!("Removing existing container {}", cont.name))?;
-                    } else {
-                        println!("{} Skipping container {}", "[INFO]".blue(), cont.name);
-                        continue;
-                    }
-                }
-
-                if cont.auto_start {
-                    let mut command = format!("podman run -d --name={} --label managed-by=repro-setup", cont.name);
-
-                    if let Some(flags) = &cont.raw_flags {
-                        let replaced_flags = flags.replace("$HOME", home_path);
-                        command.push(' ');
-                        command.push_str(&replaced_flags);
-                    }
-
-                    command.push(' ');
-                    command.push_str(&cont.image);
-
-                    let output = Command::new("sh")
-                        .arg("-c")
-                        .arg(&command)
-                        .output()
-                        .with_context(|| format!("Failed to start container: {}", cont.name))?;
-
-                    if !output.status.success() {
-                        let stderr = String::from_utf8_lossy(&output.stderr);
-                        println!("{} Failed to start container {}: {}", "[ERROR]".red(), cont.name, stderr);
-                        anyhow::bail!("Container startup failed: {}", cont.name);
-                    }
-
-                    println!("{} Successfully started container {}", "[SUCCESS]".green(), cont.name);
-                }
+                manage_containers_smart(containers, home_path, &args)?;
             }
-        }
     }
 
-    // WireGuard setup
-    if let Some(wg) = &config.wireguard {
-        run_command(&["sudo", "dnf", "install", "-y", "--skip-unavailable", "wireguard-tools"], "Installing WireGuard tools")?;
-
-        // Derive interface name from conf_path (e.g., "wg0.conf" -> "wg0")
-        use std::path::Path;
-        let conf_path = Path::new(&wg.conf_path);
-        let interface_name = conf_path.file_stem()
-            .context("Invalid conf_path: missing file stem")?
-            .to_str()
-            .context("Invalid conf_path: non-UTF8 stem")?
-            .to_string();
-
-        // Install WireGuard and NetworkManager plugin
-        install_wireguard_packages(&config.distro)?;
-
-        // Ensure system-connections dir exists
-        run_command(&["sudo", "mkdir", "-p", "/etc/NetworkManager/system-connections"], "Creating NetworkManager system-connections directory")?;
-
-        // Remove existing connection if present (idempotent)
-        let _ = run_command(&["nmcli", "connection", "delete", &interface_name], "Removing existing WireGuard connection if present");
-
-        // Import config into NetworkManager
-        run_command(&["nmcli", "connection", "import", "type", "wireguard", "file", &wg.conf_path], &format!("Importing WireGuard config for {}", interface_name))?;
-
-        // Copy config to system-connections for persistence
-        let nm_connection_file = format!("/etc/NetworkManager/system-connections/wg-{}.nmconnection", interface_name);
-        run_command(&["sudo", "nmcli", "connection", "export", &interface_name], &format!("Exporting connection to {}", nm_connection_file))?;
-        run_command(&["sudo", "chmod", "600", &nm_connection_file], "Setting secure permissions on NetworkManager connection file")?;
-
-        // Explicitly set autoconnect and save
-        run_command(&["nmcli", "connection", "modify", &interface_name, "connection.autoconnect", "yes"], &format!("Enabling autoconnect for {}", interface_name))?;
-        run_command(&["nmcli", "connection", "modify", &interface_name, "connection.autoconnect-priority", "10"], &format!("Setting autoconnect priority for {}", interface_name))?;
-
-        // Reload NetworkManager to ensure connection is loaded
-        run_command(&["sudo", "systemctl", "reload", "NetworkManager"], "Reloading NetworkManager to apply connection")?;
-
-        // Verify connection exists
-        let output = run_command_output(&["nmcli", "connection", "show", &interface_name])?;
-        if !output.status.success() {
-            println!("{}", format!("Failed to verify {} connection in NetworkManager", interface_name).red());
-            anyhow::bail!("Connection not found after import");
+    // VPN setup (WireGuard or OpenVPN)
+    if let Some(vpn) = &config.vpn {
+        match vpn.vpn_type {
+            VpnType::Wireguard => setup_wireguard_vpn(vpn)?,
+            VpnType::Openvpn => setup_openvpn_vpn(vpn)?,
         }
-
-        // Activate the connection
-        run_command(&["nmcli", "connection", "up", &interface_name], &format!("Activating WireGuard connection {}", interface_name))?;
     }
 
     // Dotfiles setup
@@ -389,8 +361,8 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
     if let Some(hostname) = config.system.hostname {
         println!("✅ Hostname set to: {}", hostname);
     }
-    if config.wireguard.is_some() {
-        println!("✅ WireGuard VPN configured with autoconnect");
+    if config.vpn.is_some() {
+        println!("✅ VPN configured with autoconnect");
     }
     // Add more summary items as needed...
 
@@ -602,6 +574,46 @@ fn get_state_file_path() -> Result<std::path::PathBuf> {
     let config_dir = home_dir.join(".config").join("repro-setup");
     fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
     Ok(config_dir.join("executed_commands.json"))
+}
+
+fn get_container_state_file_path() -> Result<std::path::PathBuf> {
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    let config_dir = home_dir.join(".config").join("repro-setup");
+    fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
+    Ok(config_dir.join("container_state.json"))
+}
+
+fn load_container_state() -> Result<ContainerState> {
+    let state_file = get_container_state_file_path()?;
+
+    if state_file.exists() {
+        let content = fs::read_to_string(&state_file)
+            .context("Failed to read container state file")?;
+        let state: ContainerState = serde_json::from_str(&content)
+            .context("Failed to parse container state file")?;
+        Ok(state)
+    } else {
+        Ok(ContainerState::default())
+    }
+}
+
+fn save_container_state(state: &ContainerState) -> Result<()> {
+    let state_file = get_container_state_file_path()?;
+    let content = serde_json::to_string_pretty(state)
+        .context("Failed to serialize container state")?;
+    fs::write(&state_file, content)
+        .context("Failed to write container state file")?;
+    Ok(())
+}
+
+fn generate_container_config_hash(container: &Container) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(container.name.as_bytes());
+    hasher.update(container.image.as_bytes());
+    hasher.update(container.raw_flags.as_deref().unwrap_or("").as_bytes());
+    hasher.update(&[if container.start_after_creation { 1 } else { 0 }]);
+    hasher.update(&[if container.autostart.unwrap_or(false) { 1 } else { 0 }]);
+    format!("{:x}", hasher.finalize())
 }
 
 fn load_executed_commands_state() -> Result<ExecutedCommandsState> {
@@ -978,11 +990,87 @@ fn parse_flatpak_package(package: &str) -> (&str, &str) {
     }
 }
 
-fn install_wireguard_packages(_distro: &Distro) -> Result<()> {
-    // Enable Copr repo for NM WireGuard plugin (idempotent)
-    run_command(&["sudo", "dnf", "copr", "enable", "-y", "timn/NetworkManager-wireguard"], "Enabling Copr repo for NetworkManager WireGuard plugin")?;
-    // Install NM WireGuard plugin
-    run_command(&["sudo", "dnf", "install", "-y", "NetworkManager-wireguard-gtk"], "Installing NetworkManager WireGuard plugin")?;
+fn setup_wireguard_vpn(vpn: &VpnConfig) -> Result<()> {
+    // Install WireGuard tools
+    run_command(&["sudo", "dnf", "install", "-y", "--skip-unavailable", "wireguard-tools"], "Installing WireGuard tools")?;
+
+    // Try to install NetworkManager WireGuard plugin gracefully
+    install_wireguard_packages_graceful()?;
+
+    // Derive interface name from conf_path (e.g., "wg0.conf" -> "wg0")
+    use std::path::Path;
+    let conf_path = Path::new(&vpn.conf_path);
+    let interface_name = conf_path.file_stem()
+        .context("Invalid conf_path: missing file stem")?
+        .to_str()
+        .context("Invalid conf_path: non-UTF8 stem")?
+        .to_string();
+
+    // Ensure system-connections dir exists
+    run_command(&["sudo", "mkdir", "-p", "/etc/NetworkManager/system-connections"], "Creating NetworkManager system-connections directory")?;
+
+    // Remove existing connection if present (idempotent)
+    let _ = run_command(&["nmcli", "connection", "delete", &interface_name], "Removing existing WireGuard connection if present");
+
+    // Import config into NetworkManager
+    run_command(&["nmcli", "connection", "import", "type", "wireguard", "file", &vpn.conf_path], &format!("Importing WireGuard config for {}", interface_name))?;
+
+    // Set autoconnect and priority
+    run_command(&["nmcli", "connection", "modify", &interface_name, "connection.autoconnect", "yes"], &format!("Enabling autoconnect for {}", interface_name))?;
+    run_command(&["nmcli", "connection", "modify", &interface_name, "connection.autoconnect-priority", "10"], &format!("Setting autoconnect priority for {}", interface_name))?;
+
+    // Reload NetworkManager and activate
+    run_command(&["sudo", "systemctl", "reload", "NetworkManager"], "Reloading NetworkManager to apply connection")?;
+    run_command(&["nmcli", "connection", "up", &interface_name], &format!("Activating WireGuard connection {}", interface_name))?;
+
+    Ok(())
+}
+
+fn setup_openvpn_vpn(vpn: &VpnConfig) -> Result<()> {
+    // Install OpenVPN and NetworkManager plugin
+    run_command(&["sudo", "dnf", "install", "-y", "openvpn", "NetworkManager-openvpn", "NetworkManager-openvpn-gnome"], "Installing OpenVPN and NetworkManager plugin")?;
+
+    // Derive connection name from conf_path
+    use std::path::Path;
+    let conf_path = Path::new(&vpn.conf_path);
+    let connection_name = conf_path.file_stem()
+        .context("Invalid conf_path: missing file stem")?
+        .to_str()
+        .context("Invalid conf_path: non-UTF8 stem")?
+        .to_string();
+
+    // Remove existing connection if present
+    let _ = run_command(&["nmcli", "connection", "delete", &connection_name], "Removing existing OpenVPN connection if present");
+
+    // Import OpenVPN config
+    run_command(&["nmcli", "connection", "import", "type", "openvpn", "file", &vpn.conf_path], &format!("Importing OpenVPN config for {}", connection_name))?;
+
+    // Set autoconnect
+    run_command(&["nmcli", "connection", "modify", &connection_name, "connection.autoconnect", "yes"], &format!("Enabling autoconnect for {}", connection_name))?;
+    run_command(&["nmcli", "connection", "modify", &connection_name, "connection.autoconnect-priority", "10"], &format!("Setting autoconnect priority for {}", connection_name))?;
+
+    // Activate the connection
+    run_command(&["nmcli", "connection", "up", &connection_name], &format!("Activating OpenVPN connection {}", connection_name))?;
+
+    Ok(())
+}
+
+fn install_wireguard_packages_graceful() -> Result<()> {
+    // Try to enable Copr repo, but don't fail if it's not available for current Fedora version
+    let copr_result = run_command(&["sudo", "dnf", "copr", "enable", "-y", "timn/NetworkManager-wireguard"], "Enabling Copr repo for NetworkManager WireGuard plugin");
+
+    if copr_result.is_err() {
+        println!("{} NetworkManager WireGuard plugin Copr repo not available for this Fedora version, using basic WireGuard tools only", "[WARNING]".yellow());
+        return Ok(());
+    }
+
+    // Try to install the plugin, but don't fail if it's not available
+    let plugin_result = run_command(&["sudo", "dnf", "install", "-y", "NetworkManager-wireguard-gtk"], "Installing NetworkManager WireGuard plugin");
+
+    if plugin_result.is_err() {
+        println!("{} NetworkManager WireGuard plugin not available, using basic WireGuard tools only", "[WARNING]".yellow());
+    }
+
     Ok(())
 }
 
@@ -1178,6 +1266,640 @@ fn setup_display_manager(_distro: &Distro, display_manager: &str) -> Result<()> 
 
     println!("{} Display manager {} configured successfully", "[SUCCESS]".green(), display_manager);
     println!("{} Reboot required for display manager changes to take effect", "[INFO]".yellow());
+
+    Ok(())
+}
+
+fn setup_drives(drives: &[DriveConfig], verbose: bool) -> Result<()> {
+    if drives.is_empty() {
+        return Ok(());
+    }
+
+    println!("{} Setting up drive mounting...", "[INFO]".blue());
+
+    // Install required packages for drive mounting
+    install_drive_packages(verbose)?;
+
+    for drive in drives {
+        setup_single_drive(drive, verbose)?;
+    }
+
+    println!("{} All drives configured successfully!", "[SUCCESS]".green());
+    Ok(())
+}
+
+fn install_drive_packages(verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Installing drive mounting packages", "[DEBUG]".cyan());
+    }
+
+    // Install cryptsetup for encrypted drives and other utilities
+    run_command(&["sudo", "dnf", "install", "-y", "--skip-unavailable", "cryptsetup", "util-linux"], "Installing drive mounting utilities")?;
+    Ok(())
+}
+
+fn setup_single_drive(drive: &DriveConfig, verbose: bool) -> Result<()> {
+    println!("{} Configuring drive {} -> {}", "[INFO]".blue(), drive.device, drive.mount_point);
+
+    // Check if device exists
+    if !std::path::Path::new(&drive.device).exists() {
+        println!("{} Device {} does not exist, skipping", "[WARN]".yellow(), drive.device);
+        return Ok(());
+    }
+
+    // Create mount point
+    run_command(&["sudo", "mkdir", "-p", &drive.mount_point], &format!("Creating mount point {}", drive.mount_point))?;
+
+    if drive.encrypted {
+        setup_encrypted_drive(drive, verbose)?;
+    } else {
+        setup_unencrypted_drive(drive, verbose)?;
+    }
+
+    Ok(())
+}
+
+fn setup_unencrypted_drive(drive: &DriveConfig, verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Setting up unencrypted drive {}", "[DEBUG]".cyan(), drive.device);
+    }
+
+    // Get filesystem type if not specified
+    let filesystem = drive.filesystem.as_deref().unwrap_or("auto");
+
+    // Get UUID of the device
+    let uuid_output = run_command_output(&["sudo", "blkid", "-s", "UUID", "-o", "value", &drive.device])?;
+    let uuid = String::from_utf8_lossy(&uuid_output.stdout).trim().to_string();
+
+    if uuid.is_empty() {
+        println!("{} Could not get UUID for {}, using device path", "[WARN]".yellow(), drive.device);
+        add_to_fstab(&drive.device, &drive.mount_point, filesystem, "defaults", drive.force_update.unwrap_or(false), verbose)?;
+    } else {
+        let uuid_device = format!("UUID={}", uuid);
+        add_to_fstab(&uuid_device, &drive.mount_point, filesystem, "defaults", drive.force_update.unwrap_or(false), verbose)?;
+    }
+
+    // Mount the drive
+    run_command(&["sudo", "mount", &drive.device, &drive.mount_point], &format!("Mounting {} to {}", drive.device, drive.mount_point))?;
+
+    println!("{} Unencrypted drive {} mounted successfully", "[SUCCESS]".green(), drive.device);
+    Ok(())
+}
+
+fn setup_encrypted_drive(drive: &DriveConfig, verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Setting up encrypted drive {}", "[DEBUG]".cyan(), drive.device);
+    }
+
+    // Generate a mapper name based on the label or device name
+    let default_name = drive.device.replace("/dev/", "").replace("/", "_");
+    let mapper_name = drive.label.as_deref().unwrap_or(&default_name);
+    let mapper_path = format!("/dev/mapper/{}", mapper_name);
+
+    // Get UUID of the encrypted device
+    let uuid_output = run_command_output(&["sudo", "blkid", "-s", "UUID", "-o", "value", &drive.device])?;
+    let uuid = String::from_utf8_lossy(&uuid_output.stdout).trim().to_string();
+
+    if uuid.is_empty() {
+        anyhow::bail!("Could not get UUID for encrypted device {}", drive.device);
+    }
+
+    // Add to crypttab
+    add_to_crypttab(mapper_name, &uuid, drive.force_update.unwrap_or(false), verbose)?;
+
+    // Check if the encrypted device is already opened
+    if !std::path::Path::new(&mapper_path).exists() {
+        println!("{} Opening encrypted device {} (you may need to enter passphrase)", "[INFO]".blue(), drive.device);
+        run_command(&["sudo", "cryptsetup", "open", &drive.device, mapper_name], &format!("Opening encrypted device {}", drive.device))?;
+    }
+
+    // Get filesystem type if not specified
+    let filesystem = drive.filesystem.as_deref().unwrap_or("auto");
+
+    // Add to fstab using the mapper path
+    add_to_fstab(&mapper_path, &drive.mount_point, filesystem, "defaults", drive.force_update.unwrap_or(false), verbose)?;
+
+    // Mount the decrypted drive
+    run_command(&["sudo", "mount", &mapper_path, &drive.mount_point], &format!("Mounting decrypted {} to {}", mapper_path, drive.mount_point))?;
+
+    println!("{} Encrypted drive {} mounted successfully", "[SUCCESS]".green(), drive.device);
+    Ok(())
+}
+
+fn add_to_crypttab(mapper_name: &str, uuid: &str, force_update: bool, verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Adding {} to /etc/crypttab", "[DEBUG]".cyan(), mapper_name);
+    }
+
+    let crypttab_entry = format!("{} UUID={} none luks", mapper_name, uuid);
+
+    // Read current crypttab content
+    let crypttab_content = std::fs::read_to_string("/etc/crypttab").unwrap_or_default();
+
+    // Check if entry already exists
+    let entry_exists = crypttab_content.lines().any(|line| {
+        line.trim().starts_with(&format!("{} ", mapper_name)) || line.trim() == mapper_name
+    });
+
+    if entry_exists && !force_update {
+        println!("{} Entry for {} already exists in /etc/crypttab", "[INFO]".blue(), mapper_name);
+        return Ok(());
+    }
+
+    if entry_exists && force_update {
+        if verbose {
+            println!("{} Updating existing {} entry in /etc/crypttab", "[DEBUG]".cyan(), mapper_name);
+        }
+
+        // Remove existing entry and add new one
+        let updated_content = crypttab_content
+            .lines()
+            .filter(|line| !line.trim().starts_with(&format!("{} ", mapper_name)) && line.trim() != mapper_name)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let final_content = if updated_content.trim().is_empty() {
+            crypttab_entry
+        } else {
+            format!("{}\n{}", updated_content, crypttab_entry)
+        };
+
+        // Write updated content
+        let write_cmd = format!("echo '{}' | sudo tee /etc/crypttab > /dev/null", final_content);
+        run_command(&["sh", "-c", &write_cmd], &format!("Updating {} in /etc/crypttab", mapper_name))?;
+    } else {
+        // Append new entry
+        let append_cmd = format!("echo '{}' | sudo tee -a /etc/crypttab > /dev/null", crypttab_entry);
+        run_command(&["sh", "-c", &append_cmd], &format!("Adding {} to /etc/crypttab", mapper_name))?;
+    }
+
+    println!("{} Added {} to /etc/crypttab", "[SUCCESS]".green(), mapper_name);
+    Ok(())
+}
+
+fn add_to_fstab(device: &str, mount_point: &str, filesystem: &str, options: &str, force_update: bool, verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Adding {} to /etc/fstab", "[DEBUG]".cyan(), device);
+    }
+
+    let fstab_entry = format!("{} {} {} {} 0 2", device, mount_point, filesystem, options);
+
+    // Read current fstab content
+    let fstab_content = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
+
+    // Check if entry already exists (check for mount point since device might change)
+    let entry_exists = fstab_content.lines().any(|line| {
+        line.trim().split_whitespace().nth(1) == Some(mount_point)
+    });
+
+    if entry_exists && !force_update {
+        println!("{} Entry for {} already exists in /etc/fstab", "[INFO]".blue(), mount_point);
+        return Ok(());
+    }
+
+    // Backup fstab
+    run_command(&["sudo", "cp", "/etc/fstab", "/etc/fstab.backup"], "Backing up /etc/fstab")?;
+
+    if entry_exists && force_update {
+        if verbose {
+            println!("{} Updating existing {} entry in /etc/fstab", "[DEBUG]".cyan(), mount_point);
+        }
+
+        // Remove existing entry and add new one
+        let updated_content = fstab_content
+            .lines()
+            .filter(|line| {
+                line.trim().split_whitespace().nth(1) != Some(mount_point)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let final_content = if updated_content.trim().is_empty() {
+            fstab_entry
+        } else {
+            format!("{}\n{}", updated_content, fstab_entry)
+        };
+
+        // Write updated content
+        let write_cmd = format!("echo '{}' | sudo tee /etc/fstab > /dev/null", final_content);
+        run_command(&["sh", "-c", &write_cmd], &format!("Updating {} in /etc/fstab", mount_point))?;
+    } else {
+        // Append new entry
+        let append_cmd = format!("echo '{}' | sudo tee -a /etc/fstab > /dev/null", fstab_entry);
+        run_command(&["sh", "-c", &append_cmd], &format!("Adding {} to /etc/fstab", mount_point))?;
+    }
+
+    println!("{} Added {} to /etc/fstab", "[SUCCESS]".green(), mount_point);
+    Ok(())
+}
+
+fn manage_containers_smart(containers: &[Container], home_path: &str, args: &Args) -> Result<()> {
+    println!("{} Managing containers with smart lifecycle", "[INFO]".blue());
+
+    // Load container state
+    let mut state = load_container_state()?;
+
+    // Get existing containers
+    let existing_containers = get_existing_containers()?;
+
+    // Analyze what needs to be done
+    let mut actions = Vec::new();
+
+    for container in containers {
+        let action = determine_container_action(container, &state, &existing_containers, args)?;
+        actions.push((container, action));
+    }
+
+    // Show summary of actions
+    if !actions.is_empty() && !args.yes {
+        show_container_action_summary(&actions);
+        if !ask_user_confirmation("Proceed with container operations?", args.yes, args.no, args.verbose)? {
+            println!("{} Container operations cancelled", "[INFO]".blue());
+            return Ok(());
+        }
+    }
+
+    // Execute actions
+    for (container, action) in &actions {
+        execute_container_action(container, action, home_path, &mut state, args)?;
+    }
+
+    // Save updated state
+    save_container_state(&state)?;
+
+    // Setup autostart for containers that need it
+    let autostart_containers: Vec<_> = containers.iter()
+        .filter(|c| c.autostart.unwrap_or(false))
+        .collect();
+
+    if !autostart_containers.is_empty() {
+        setup_container_autostart(&autostart_containers, args.verbose)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+enum ContainerAction {
+    Skip,
+    Create,
+    Update,
+    Recreate,
+}
+
+fn get_existing_containers() -> Result<HashMap<String, String>> {
+    let output = Command::new("podman")
+        .args(&["ps", "-a", "--format", "{{.Names}}"])
+        .output()
+        .context("Failed to list existing containers")?;
+
+    let mut containers = HashMap::new();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        let name = line.trim();
+        if !name.is_empty() {
+            containers.insert(name.to_string(), name.to_string());
+        }
+    }
+
+    Ok(containers)
+}
+
+fn determine_container_action(
+    container: &Container,
+    state: &ContainerState,
+    existing_containers: &HashMap<String, String>,
+    args: &Args,
+) -> Result<ContainerAction> {
+    let current_hash = generate_container_config_hash(container);
+    let exists = existing_containers.contains_key(&container.name);
+
+    // Check CLI overrides
+    if args.force_recreate {
+        return Ok(if exists { ContainerAction::Recreate } else { ContainerAction::Create });
+    }
+
+    if args.no_recreate {
+        return Ok(ContainerAction::Skip);
+    }
+
+    // Check if container exists
+    if !exists {
+        return Ok(ContainerAction::Create);
+    }
+
+    // Check if we have previous state
+    if let Some(container_info) = state.containers.get(&container.name) {
+        if container_info.config_hash != current_hash {
+            return Ok(ContainerAction::Update);
+        } else {
+            return Ok(ContainerAction::Skip);
+        }
+    }
+
+    // Container exists but no state - likely first run with existing container
+    Ok(ContainerAction::Update)
+}
+
+fn show_container_action_summary(actions: &[(&Container, ContainerAction)]) {
+    println!("\n{} Container Actions Summary:", "[INFO]".blue());
+
+    for (container, action) in actions {
+        match action {
+            ContainerAction::Skip => continue,
+            ContainerAction::Create => println!("  {} {}: Create new container", "✨".green(), container.name),
+            ContainerAction::Update => println!("  {} {}: Update (config changed)", "🔄".yellow(), container.name),
+            ContainerAction::Recreate => println!("  {} {}: Force recreate", "🔨".red(), container.name),
+        }
+    }
+    println!();
+}
+
+fn execute_container_action(
+    container: &Container,
+    action: &ContainerAction,
+    home_path: &str,
+    state: &mut ContainerState,
+    args: &Args,
+) -> Result<()> {
+    match action {
+        ContainerAction::Skip => {
+            if args.verbose {
+                println!("{} Skipping {} (no changes)", "[DEBUG]".cyan(), container.name);
+            }
+            return Ok(());
+        }
+        ContainerAction::Create => {
+            println!("{} Creating container {}", "[INFO]".blue(), container.name);
+        }
+        ContainerAction::Update => {
+            println!("{} Updating container {} (config changed)", "[INFO]".blue(), container.name);
+            // Remove existing container
+            run_command(&["podman", "rm", "-f", &container.name], &format!("Removing existing container {}", container.name))?;
+        }
+        ContainerAction::Recreate => {
+            println!("{} Recreating container {}", "[INFO]".blue(), container.name);
+            // Remove existing container
+            run_command(&["podman", "rm", "-f", &container.name], &format!("Removing existing container {}", container.name))?;
+        }
+    }
+
+    // Check for conflicting startup configurations
+    if container.start_after_creation && container.autostart.unwrap_or(false) {
+        println!("{} Container '{}' has both start_after_creation=true and autostart=true", "[WARNING]".yellow(), container.name);
+        println!("  This creates a conflict between immediate startup and systemd management.");
+        println!("  Consider renaming 'start_after_creation' to 'immediate_start' for clarity.");
+        println!("  Using systemd management (autostart=true) and skipping immediate startup.");
+    }
+
+    // Only start immediately if not managed by systemd autostart
+    if container.start_after_creation && !container.autostart.unwrap_or(false) {
+        create_and_start_container(container, home_path)?;
+    } else if !container.start_after_creation {
+        // Just create the container without starting
+        create_container_only(container, home_path)?;
+    }
+
+    // Update state
+    let container_info = ContainerInfo {
+        config_hash: generate_container_config_hash(container),
+        image_hash: None, // TODO: Get actual image hash
+        last_updated: get_current_timestamp(),
+        managed: true,
+    };
+
+    state.containers.insert(container.name.clone(), container_info);
+
+    println!("{} Container {} processed successfully", "[SUCCESS]".green(), container.name);
+    Ok(())
+}
+
+fn create_and_start_container(container: &Container, home_path: &str) -> Result<()> {
+    let mut command = format!("podman run -d --name={} --label managed-by=repro-setup", container.name);
+
+    if let Some(flags) = &container.raw_flags {
+        let replaced_flags = flags.replace("$HOME", home_path);
+        command.push(' ');
+        command.push_str(&replaced_flags);
+    }
+
+    command.push(' ');
+    command.push_str(&container.image);
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .with_context(|| format!("Failed to start container: {}", container.name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{} Failed to start container {}: {}", "[ERROR]".red(), container.name, stderr);
+        anyhow::bail!("Container startup failed: {}", container.name);
+    }
+
+    Ok(())
+}
+
+fn create_container_only(container: &Container, home_path: &str) -> Result<()> {
+    let mut command = format!("podman create --name={} --label managed-by=repro-setup", container.name);
+
+    if let Some(flags) = &container.raw_flags {
+        let replaced_flags = flags.replace("$HOME", home_path);
+        command.push(' ');
+        command.push_str(&replaced_flags);
+    }
+
+    command.push(' ');
+    command.push_str(&container.image);
+
+    let output = Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .output()
+        .with_context(|| format!("Failed to create container: {}", container.name))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        println!("{} Failed to create container {}: {}", "[ERROR]".red(), container.name, stderr);
+        anyhow::bail!("Container creation failed: {}", container.name);
+    }
+
+    Ok(())
+}
+
+fn setup_container_autostart(containers: &[&Container], verbose: bool) -> Result<()> {
+    let autostart_containers: Vec<_> = containers.iter()
+        .filter(|cont| cont.autostart.unwrap_or(false))
+        .collect();
+
+    if autostart_containers.is_empty() {
+        if verbose {
+            println!("{} No containers configured for autostart", "[DEBUG]".cyan());
+        }
+        return Ok(());
+    }
+
+    println!("{} Setting up autostart for {} containers using Quadlet", "[INFO]".blue(), autostart_containers.len());
+
+    // Create systemd user directory for Quadlet
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    let quadlet_dir = home_dir.join(".config/containers/systemd");
+    std::fs::create_dir_all(&quadlet_dir)
+        .context("Failed to create Quadlet directory")?;
+
+    for container in &autostart_containers {
+        create_quadlet_file(container, &quadlet_dir, verbose)?;
+    }
+
+    // Enable lingering for the user so services start without login
+    run_command(&["sudo", "loginctl", "enable-linger", &std::env::var("USER")?], "Enabling user lingering for autostart")?;
+
+    // Reload systemd user daemon to pick up new Quadlet files
+    run_command(&["systemctl", "--user", "daemon-reload"], "Reloading systemd user daemon")?;
+
+    // For Quadlet-generated services, we don't need to manually enable them
+    // The .container files with WantedBy=default.target will auto-enable
+    for container in &autostart_containers {
+        if verbose {
+            println!("{} Container {} configured for autostart via Quadlet", "[SUCCESS]".green(), container.name);
+        }
+    }
+
+    println!("{} Quadlet autostart configuration completed!", "[SUCCESS]".green());
+    Ok(())
+}
+
+fn create_quadlet_file(container: &Container, quadlet_dir: &std::path::Path, verbose: bool) -> Result<()> {
+    let quadlet_file = quadlet_dir.join(format!("{}.container", container.name));
+
+    if verbose {
+        println!("{} Creating Quadlet file: {}", "[DEBUG]".cyan(), quadlet_file.display());
+    }
+
+    // Parse raw_flags to extract individual options
+    let mut quadlet_content = String::new();
+    quadlet_content.push_str("[Unit]\n");
+    quadlet_content.push_str(&format!("Description=Container {}\n", container.name));
+    quadlet_content.push_str("Wants=network-online.target\n");
+    quadlet_content.push_str("After=network-online.target\n");
+    quadlet_content.push_str("RequiresMountsFor=%t/containers\n\n");
+
+    quadlet_content.push_str("[Container]\n");
+    quadlet_content.push_str(&format!("Image={}\n", container.image));
+    quadlet_content.push_str(&format!("ContainerName={}\n", container.name));
+
+    // Add labels
+    quadlet_content.push_str("Label=managed-by=repro-setup\n");
+
+    // Parse raw_flags and convert to Quadlet format
+    if let Some(flags) = &container.raw_flags {
+        parse_raw_flags_to_quadlet(flags, &mut quadlet_content)?;
+    }
+
+    quadlet_content.push_str("\n[Service]\n");
+    quadlet_content.push_str("Restart=always\n");
+    quadlet_content.push_str("TimeoutStartSec=900\n\n");
+
+    quadlet_content.push_str("[Install]\n");
+    quadlet_content.push_str("WantedBy=default.target\n");
+
+    // Write the Quadlet file
+    std::fs::write(&quadlet_file, quadlet_content)
+        .context(format!("Failed to write Quadlet file for {}", container.name))?;
+
+    println!("{} Created Quadlet file for {}", "[SUCCESS]".green(), container.name);
+    Ok(())
+}
+
+fn parse_raw_flags_to_quadlet(raw_flags: &str, content: &mut String) -> Result<()> {
+    // Get home directory for volume path expansion
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    let home_path = home_dir.to_str().context("Invalid home directory path")?;
+
+    // Split raw_flags and convert to Quadlet format
+    let flags: Vec<&str> = raw_flags.split_whitespace().collect();
+    let mut i = 0;
+
+    while i < flags.len() {
+        match flags[i] {
+            "-p" | "--publish" => {
+                if i + 1 < flags.len() {
+                    content.push_str(&format!("PublishPort={}\n", flags[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "-v" | "--volume" => {
+                if i + 1 < flags.len() {
+                    // Replace $HOME with actual home path for Quadlet
+                    let volume_spec = flags[i + 1].replace("$HOME", home_path);
+                    content.push_str(&format!("Volume={}\n", volume_spec));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "-e" | "--env" => {
+                if i + 1 < flags.len() {
+                    content.push_str(&format!("Environment={}\n", flags[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "--device" => {
+                if i + 1 < flags.len() {
+                    // In Quadlet, devices are handled differently - add to PodmanArgs
+                    content.push_str(&format!("PodmanArgs=--device={}\n", flags[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "--security-opt" => {
+                if i + 1 < flags.len() {
+                    // Only add SecurityLabelDisable for seccomp options
+                    if flags[i + 1].contains("seccomp") {
+                        content.push_str("SecurityLabelDisable=true\n");
+                    }
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "--shm-size" => {
+                if i + 1 < flags.len() {
+                    content.push_str(&format!("ShmSize={}\n", flags[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "--restart" => {
+                // Skip restart flag as it's handled by systemd
+                if i + 1 < flags.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            "--cap-add" => {
+                if i + 1 < flags.len() {
+                    content.push_str(&format!("AddCapability={}\n", flags[i + 1]));
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            },
+            _ => {
+                // Skip unknown flags for now
+                i += 1;
+            }
+        }
+    }
 
     Ok(())
 }

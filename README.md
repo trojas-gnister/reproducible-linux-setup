@@ -8,7 +8,7 @@ A powerful Rust-based tool for automating Fedora Linux desktop environment setup
 - **Dotfiles Management**: Safe migration of `.bashrc` and `.config` directories with backups
 - **Container Management**: Simplified Podman container deployment with flexible flag support
 - **Desktop Environment**: Desktop environment installation and configuration with display manager setup
-- **VPN Integration**: Automated WireGuard setup with NetworkManager
+- **VPN Integration**: Automated WireGuard and OpenVPN setup with NetworkManager
 - **Package Management**: Modular system and Flatpak package installation from separate TOML files
 - **Custom Commands**: Execute additional shell commands in sequence with run-once support
 - **Interactive Setup**: User confirmation prompts for safe configuration migration
@@ -183,15 +183,36 @@ containers = [
     { name = "brave",
       image = "lscr.io/linuxserver/brave:latest",
       raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -e PGID=1000 -p 3100:3000 -p 3101:3001 -v $HOME/.config/brave:/config --shm-size=1gb --restart unless-stopped",
-      auto_start = true },
+      start_after_creation = true,
+      autostart = true },
 
     # Librewolf Browser
     { name = "librewolf",
       image = "lscr.io/linuxserver/librewolf:latest",
       raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -e PGID=1000 -p 3000:3000 -p 3001:3001 -v $HOME/.config/librewolf:/config --shm-size=1gb --restart unless-stopped",
-      auto_start = true }
+      start_after_creation = true,
+      autostart = true }
 ]
 ```
+
+### VPN Configuration (WireGuard or OpenVPN)
+```toml
+[vpn]
+# VPN type: "wireguard" or "openvpn"
+type = "wireguard"
+# Path to the VPN configuration file
+conf_path = "/home/user/vpn/wg0.conf"
+```
+
+**Supported VPN Types**:
+- `wireguard` - WireGuard VPN configuration (.conf files)
+- `openvpn` - OpenVPN configuration (.ovpn files)
+
+The tool will automatically:
+- Install the necessary VPN tools and NetworkManager plugins
+- Import the configuration into NetworkManager
+- Enable autoconnect for the VPN connection
+- Handle Fedora version compatibility issues gracefully
 
 ### Custom Commands
 ```toml
@@ -250,7 +271,8 @@ run_once = [
 ### Container-Only Setup
 ```bash
 # Disable other features, focus on containers
-# Edit config.toml to set auto_start = true for desired containers
+# Edit config.toml to set start_after_creation = true for immediate start
+# Set autostart = true for boot-time autostart via Quadlet
 ./repro-setup
 ```
 
@@ -395,12 +417,21 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 **Note**: This tool modifies system configurations. Always review the `config.toml` before running and ensure you have backups of important data.
 
 ## TODO
-- System update
-- Fix Podman Autostart functionality
-- Fix VPN
+- Automatic System update
+- define custom systemd services in the config
 - Keep containers up to date
 - Support for building and managing locally built podman containers
 - Integrate VM generation
 - Cosmic Desktop management using config.toml
 - Integrate WinApps Docker or Bottles
 - Optimize
+- Refactor application to supress command outputs with debug
+- Flatpak applications in App Menu
+- Don't attempt to re-create podman pre_container_setup commands (combine with  run once commands)
+- Only run what was changed
+- Drop bear support
+- System installation script (useful for arch linux and fedora minimal installations. define partitions to be read, setup users, etc)
+- application autostart management
+- Integrate into Cockpit? Some functionality? Can some of cockpits functionality replace what is needed by this program such as system updates?
+- Service to keep everything in sync (packages)
+- Intent of this application is to easily keep a config file of a systems core functionality that can easily be setup onto another machine with minimal setup time. virtually creating a migratible system config. the system should keep the settings in sync with the system. the application should also allow custom configurations declartively using the config files which is useful when spinning up new machines with new purposes
