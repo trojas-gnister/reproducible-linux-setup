@@ -1,6 +1,0 @@
-# Flatpak applications to install from Flathub
-packages = [
-    "com.valvesoftware.Steam",
-    "org.chromium.Chromium",
-      "io.gitlab.librewolf-community"
-]
