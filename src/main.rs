@@ -12,7 +12,7 @@ use sha2::{Sha256, Digest};
 use dirs;
 
 #[derive(Parser, Debug)]
-#[command(version, about = "Reproducible Desktop Setup System")]
+#[command(version, about = "FedoraForge - Forge your perfect Fedora system with declarative configuration")]
 struct Args {
     /// Path to the configuration file (TOML format)
     #[arg(long, default_value = "config/config.toml")]
@@ -179,6 +179,70 @@ struct PackageList {
     packages: Vec<String>,
 }
 
+// Services configuration structures
+#[derive(Deserialize, Debug)]
+struct SystemServicesConfig {
+    services: Option<HashMap<String, ServiceState>>,
+    custom_services: Option<Vec<CustomService>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct UserServicesConfig {
+    services: Option<HashMap<String, ServiceState>>,
+    custom_services: Option<Vec<CustomService>>,
+    applications: Option<HashMap<String, ApplicationAutostart>>,
+}
+
+#[derive(Deserialize, Debug)]
+struct ServiceState {
+    enabled: bool,
+    started: bool,
+}
+
+#[derive(Deserialize, Debug)]
+struct ApplicationAutostart {
+    enabled: bool,
+    restart_policy: Option<String>, // "never", "always", "on-failure"
+    delay: Option<u64>,             // seconds delay after login
+    args: Option<Vec<String>>,      // command line arguments
+    environment: Option<HashMap<String, String>>, // environment variables
+}
+
+#[derive(Deserialize, Debug)]
+struct CustomService {
+    name: String,
+    enabled: bool,
+    started: bool,
+    service_definition: String,
+    timer_definition: Option<String>,
+}
+
+#[derive(Debug)]
+struct CurrentServiceInfo {
+    enabled: bool,
+    active: bool,
+    exists: bool,
+    is_custom: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct CustomServicesState {
+    system_services: HashMap<String, CustomServiceInfo>,
+    user_services: HashMap<String, CustomServiceInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct CustomServiceInfo {
+    content_hash: String,
+    installed_at: u64,
+}
+
+#[derive(Debug, Clone)]
+enum ServiceScope {
+    System,
+    User,
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -214,12 +278,15 @@ fn main() -> Result<()> {
         });
         update_flatpak_packages_file(&flatpak_packages)?;
 
-        println!("{} Package configuration files generated successfully!", "[SUCCESS]".green());
+        // Generate services config
+        generate_initial_services_configs()?;
+
+        println!("{} Package and services configuration files generated successfully!", "[SUCCESS]".green());
         println!("Now create your main config/config.toml file and run again without --initial");
         return Ok(());
     }
 
-    println!("🚀 Starting Desktop environment setup...");
+    println!("🔥 FedoraForge: Forging your perfect Fedora system...");
 
     let config_content = fs::read_to_string(&args.config)
         .context(format!("Failed to read config file: {}", args.config))?;
@@ -280,6 +347,9 @@ fn main() -> Result<()> {
     // Synchronize Flatpak packages with installed applications
     let _flatpak_packages = sync_flatpak_packages(args.yes, args.no, args.verbose)?;
 
+    // Synchronize services with system state
+    sync_services(args.yes, args.no, args.verbose)?;
+
     // Podman setup
     if let Some(podman) = &config.podman {
         // If podman config exists, ensure podman is installed
@@ -319,8 +389,9 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
             }
 
             // Reconciliation of managed containers
-            let managed_containers_output = Command::new("podman").args(&["ps", "-a", "--filter", "label=managed-by=repro-setup", "--format", "{{.Names}}"]).output()?;
-            let managed_containers = std::io::Cursor::new(managed_containers_output.stdout).lines().collect::<Result<Vec<_>, _>>()?;
+            let managed_output = Command::new("podman").args(&["ps", "-a", "--filter", "label=managed-by=fedoraforge", "--format", "{{.Names}}"]).output()?;
+            let managed_containers = std::io::Cursor::new(managed_output.stdout).lines().collect::<Result<Vec<_>, _>>()?;
+
             let configured_containers: Vec<String> = podman.containers.as_ref().unwrap_or(&Vec::new()).iter().map(|c| c.name.clone()).collect();
 
             for container_name in managed_containers {
@@ -571,14 +642,14 @@ fn get_current_timestamp() -> u64 {
 
 fn get_state_file_path() -> Result<std::path::PathBuf> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
-    let config_dir = home_dir.join(".config").join("repro-setup");
+    let config_dir = home_dir.join(".config").join("fedoraforge");
     fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
     Ok(config_dir.join("executed_commands.json"))
 }
 
 fn get_container_state_file_path() -> Result<std::path::PathBuf> {
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
-    let config_dir = home_dir.join(".config").join("repro-setup");
+    let config_dir = home_dir.join(".config").join("fedoraforge");
     fs::create_dir_all(&config_dir).context("Failed to create config directory")?;
     Ok(config_dir.join("container_state.json"))
 }
@@ -1676,7 +1747,7 @@ fn execute_container_action(
 }
 
 fn create_and_start_container(container: &Container, home_path: &str) -> Result<()> {
-    let mut command = format!("podman run -d --name={} --label managed-by=repro-setup", container.name);
+    let mut command = format!("podman run -d --name={} --label managed-by=fedoraforge", container.name);
 
     if let Some(flags) = &container.raw_flags {
         let replaced_flags = flags.replace("$HOME", home_path);
@@ -1703,7 +1774,7 @@ fn create_and_start_container(container: &Container, home_path: &str) -> Result<
 }
 
 fn create_container_only(container: &Container, home_path: &str) -> Result<()> {
-    let mut command = format!("podman create --name={} --label managed-by=repro-setup", container.name);
+    let mut command = format!("podman create --name={} --label managed-by=fedoraforge", container.name);
 
     if let Some(flags) = &container.raw_flags {
         let replaced_flags = flags.replace("$HOME", home_path);
@@ -1791,7 +1862,7 @@ fn create_quadlet_file(container: &Container, quadlet_dir: &std::path::Path, ver
     quadlet_content.push_str(&format!("ContainerName={}\n", container.name));
 
     // Add labels
-    quadlet_content.push_str("Label=managed-by=repro-setup\n");
+    quadlet_content.push_str("Label=managed-by=fedoraforge\n");
 
     // Parse raw_flags and convert to Quadlet format
     if let Some(flags) = &container.raw_flags {
@@ -1903,3 +1974,892 @@ fn parse_raw_flags_to_quadlet(raw_flags: &str, content: &mut String) -> Result<(
 
     Ok(())
 }
+
+// ========================= SERVICES MANAGEMENT =========================
+
+fn sync_services(yes: bool, no: bool, verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Starting services synchronization", "[DEBUG]".cyan());
+    }
+
+    sync_system_services(yes, no, verbose)?;
+    sync_user_services(yes, no, verbose)?;
+
+    Ok(())
+}
+
+fn sync_system_services(yes: bool, no: bool, verbose: bool) -> Result<()> {
+    let config_path = "config/system-services.toml";
+    let config = load_system_services_config().unwrap_or_else(|_| SystemServicesConfig {
+        services: None,
+        custom_services: None,
+    });
+
+    let declared = config.services.unwrap_or_default();
+    let current = get_current_system_services(verbose)?;
+
+    sync_services_bidirectional(&declared, &current, ServiceScope::System, config_path, yes, no, verbose)?;
+
+    // Handle custom services
+    if let Some(custom_services) = config.custom_services {
+        sync_custom_services(&custom_services, ServiceScope::System, yes, no, verbose)?;
+    }
+
+    Ok(())
+}
+
+fn sync_user_services(yes: bool, no: bool, verbose: bool) -> Result<()> {
+    let config_path = "config/user-services.toml";
+    let config = load_user_services_config().unwrap_or_else(|_| UserServicesConfig {
+        services: None,
+        custom_services: None,
+        applications: None,
+    });
+
+    let declared = config.services.unwrap_or_default();
+    let current = get_current_user_services(verbose)?;
+
+    sync_services_bidirectional(&declared, &current, ServiceScope::User, config_path, yes, no, verbose)?;
+
+    // Handle custom services
+    if let Some(custom_services) = config.custom_services {
+        sync_custom_services(&custom_services, ServiceScope::User, yes, no, verbose)?;
+    }
+
+    // Handle application autostart
+    if let Some(applications) = config.applications {
+        sync_application_autostart(&applications, yes, no, verbose)?;
+    }
+
+    Ok(())
+}
+
+fn sync_services_bidirectional(
+    declared: &HashMap<String, ServiceState>,
+    current: &HashMap<String, CurrentServiceInfo>,
+    scope: ServiceScope,
+    config_path: &str,
+    yes: bool,
+    no: bool,
+    verbose: bool,
+) -> Result<()> {
+    let scope_str = match scope {
+        ServiceScope::System => "system",
+        ServiceScope::User => "user",
+    };
+
+    if verbose {
+        println!("{} Syncing {} services bidirectionally", "[DEBUG]".cyan(), scope_str);
+    }
+
+    // Find services in system but not in config (add to config)
+    let undeclared: Vec<_> = current.iter()
+        .filter(|(name, info)| {
+            info.exists && !info.is_custom && !declared.contains_key(*name) &&
+            // Only include enabled services or services that are currently running
+            (info.enabled || info.active)
+        })
+        .collect();
+
+    if !undeclared.is_empty() {
+        println!("{} Found {} {} services not in config:", "[INFO]".blue(), undeclared.len(), scope_str);
+        for (name, info) in &undeclared {
+            let status = match (info.enabled, info.active) {
+                (true, true) => "enabled and running",
+                (true, false) => "enabled but not running",
+                (false, true) => "disabled but running",
+                (false, false) => "disabled and not running",
+            };
+            println!("  - {} ({})", name, status);
+        }
+
+        if ask_user_confirmation(&format!("Add these {} services to config?", scope_str), yes, no, verbose)? {
+            update_services_config_with_discovered(&undeclared, config_path, scope.clone())?;
+            println!("{} Added {} services to {}", "[SUCCESS]".green(), undeclared.len(), config_path);
+        }
+    }
+
+    // Find services in config but with different states (apply changes)
+    let to_change: Vec<_> = declared.iter()
+        .filter_map(|(name, desired)| {
+            current.get(name).and_then(|current_info| {
+                if !current_info.exists {
+                    println!("{} Service '{}' declared in config but not found on system", "[WARN]".yellow(), name);
+                    None
+                } else if current_info.enabled != desired.enabled || current_info.active != desired.started {
+                    Some((name, desired, current_info))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    if !to_change.is_empty() {
+        println!("{} Found {} {} services with different states:", "[INFO]".blue(), to_change.len(), scope_str);
+        for (name, desired, current) in &to_change {
+            println!("  - {}: current(enabled={}, active={}) -> desired(enabled={}, started={})",
+                name, current.enabled, current.active, desired.enabled, desired.started);
+        }
+
+        if ask_user_confirmation(&format!("Apply these {} service changes?", scope_str), yes, no, verbose)? {
+            apply_service_changes(&to_change, scope)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn get_current_system_services(verbose: bool) -> Result<HashMap<String, CurrentServiceInfo>> {
+    if verbose {
+        println!("{} Discovering system services", "[DEBUG]".cyan());
+    }
+
+    let mut services = HashMap::new();
+
+    // Get enabled/disabled state
+    let output = run_command_output(&["systemctl", "list-unit-files", "--type=service", "--no-pager", "--plain"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line.starts_with("UNIT FILE") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let name = parts[0].trim_end_matches(".service");
+            let enabled = parts[1] == "enabled";
+            services.insert(name.to_string(), CurrentServiceInfo {
+                enabled,
+                active: false, // Will be updated below
+                exists: true,
+                is_custom: false, // Will be updated if we find it's custom
+            });
+        }
+    }
+
+    // Get active/inactive state
+    let output = run_command_output(&["systemctl", "list-units", "--type=service", "--no-pager", "--plain"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line.starts_with("UNIT") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let name = parts[0].trim_end_matches(".service");
+            let active = parts[2] == "active";
+            if let Some(service) = services.get_mut(name) {
+                service.active = active;
+            }
+        }
+    }
+
+    // Mark custom services
+    let custom_state = load_custom_services_state().unwrap_or_default();
+    for service_name in custom_state.system_services.keys() {
+        if let Some(service) = services.get_mut(service_name) {
+            service.is_custom = true;
+        }
+    }
+
+    if verbose {
+        println!("{} Found {} system services", "[DEBUG]".cyan(), services.len());
+    }
+
+    Ok(services)
+}
+
+fn get_current_user_services(verbose: bool) -> Result<HashMap<String, CurrentServiceInfo>> {
+    if verbose {
+        println!("{} Discovering user services", "[DEBUG]".cyan());
+    }
+
+    let mut services = HashMap::new();
+
+    // Get enabled/disabled state
+    let output = run_command_output(&["systemctl", "--user", "list-unit-files", "--type=service", "--no-pager", "--plain"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line.starts_with("UNIT FILE") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let name = parts[0].trim_end_matches(".service");
+            let enabled = parts[1] == "enabled";
+            services.insert(name.to_string(), CurrentServiceInfo {
+                enabled,
+                active: false, // Will be updated below
+                exists: true,
+                is_custom: false, // Will be updated if we find it's custom
+            });
+        }
+    }
+
+    // Get active/inactive state
+    let output = run_command_output(&["systemctl", "--user", "list-units", "--type=service", "--no-pager", "--plain"])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        if line.trim().is_empty() || line.starts_with("UNIT") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let name = parts[0].trim_end_matches(".service");
+            let active = parts[2] == "active";
+            if let Some(service) = services.get_mut(name) {
+                service.active = active;
+            }
+        }
+    }
+
+    // Mark custom services
+    let custom_state = load_custom_services_state().unwrap_or_default();
+    for service_name in custom_state.user_services.keys() {
+        if let Some(service) = services.get_mut(service_name) {
+            service.is_custom = true;
+        }
+    }
+
+    if verbose {
+        println!("{} Found {} user services", "[DEBUG]".cyan(), services.len());
+    }
+
+    Ok(services)
+}
+
+fn apply_service_changes(
+    changes: &[(&String, &ServiceState, &CurrentServiceInfo)],
+    scope: ServiceScope,
+) -> Result<()> {
+    for (name, desired, current) in changes {
+        // Handle enabled state
+        if current.enabled != desired.enabled {
+            if desired.enabled {
+                enable_service(name, &scope)?;
+            } else {
+                disable_service(name, &scope)?;
+            }
+        }
+
+        // Handle started state
+        if current.active != desired.started {
+            if desired.started {
+                start_service(name, &scope)?;
+            } else {
+                stop_service(name, &scope)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn enable_service(name: &str, scope: &ServiceScope) -> Result<()> {
+    match scope {
+        ServiceScope::System => {
+            run_command(&["sudo", "systemctl", "enable", name], &format!("Enabling system service {}", name))?;
+        }
+        ServiceScope::User => {
+            run_command(&["systemctl", "--user", "enable", name], &format!("Enabling user service {}", name))?;
+        }
+    }
+    Ok(())
+}
+
+fn disable_service(name: &str, scope: &ServiceScope) -> Result<()> {
+    match scope {
+        ServiceScope::System => {
+            run_command(&["sudo", "systemctl", "disable", name], &format!("Disabling system service {}", name))?;
+        }
+        ServiceScope::User => {
+            run_command(&["systemctl", "--user", "disable", name], &format!("Disabling user service {}", name))?;
+        }
+    }
+    Ok(())
+}
+
+fn start_service(name: &str, scope: &ServiceScope) -> Result<()> {
+    match scope {
+        ServiceScope::System => {
+            run_command(&["sudo", "systemctl", "start", name], &format!("Starting system service {}", name))?;
+        }
+        ServiceScope::User => {
+            run_command(&["systemctl", "--user", "start", name], &format!("Starting user service {}", name))?;
+        }
+    }
+    Ok(())
+}
+
+fn stop_service(name: &str, scope: &ServiceScope) -> Result<()> {
+    match scope {
+        ServiceScope::System => {
+            run_command(&["sudo", "systemctl", "stop", name], &format!("Stopping system service {}", name))?;
+        }
+        ServiceScope::User => {
+            run_command(&["systemctl", "--user", "stop", name], &format!("Stopping user service {}", name))?;
+        }
+    }
+    Ok(())
+}
+
+// ========================= CUSTOM SERVICES MANAGEMENT =========================
+
+fn sync_custom_services(
+    custom_services: &[CustomService],
+    scope: ServiceScope,
+    yes: bool,
+    no: bool,
+    verbose: bool,
+) -> Result<()> {
+    let mut state = load_custom_services_state()?;
+    let scope_str = match scope {
+        ServiceScope::System => "system",
+        ServiceScope::User => "user",
+    };
+
+    if verbose {
+        println!("{} Syncing {} custom services", "[DEBUG]".cyan(), scope_str);
+    }
+
+    for service in custom_services {
+        let service_hash = generate_service_hash(&service.service_definition, &service.timer_definition)?;
+        let state_map = match scope {
+            ServiceScope::System => &mut state.system_services,
+            ServiceScope::User => &mut state.user_services,
+        };
+
+        let needs_install = match state_map.get(&service.name) {
+            Some(info) => info.content_hash != service_hash,
+            None => true,
+        };
+
+        if needs_install {
+            if ask_user_confirmation(&format!("Install/update custom {} service '{}'?", scope_str, service.name), yes, no, verbose)? {
+                install_custom_service(service, &service_hash, &scope, state_map)?;
+            }
+        }
+
+        // Sync enabled/started state
+        sync_custom_service_state(service, &scope, verbose)?;
+    }
+
+    // Remove orphaned custom services
+    cleanup_orphaned_custom_services(custom_services, &mut state, &scope, yes, no, verbose)?;
+
+    save_custom_services_state(&state)?;
+    Ok(())
+}
+
+fn install_custom_service(
+    service: &CustomService,
+    content_hash: &str,
+    scope: &ServiceScope,
+    state_map: &mut HashMap<String, CustomServiceInfo>,
+) -> Result<()> {
+    let service_dir = match scope {
+        ServiceScope::System => "/etc/systemd/system".to_string(),
+        ServiceScope::User => {
+            let home = dirs::home_dir().context("Could not find home directory")?;
+            let user_dir = home.join(".config/systemd/user");
+            fs::create_dir_all(&user_dir)?;
+            user_dir.to_str().unwrap().to_string()
+        }
+    };
+
+    // Write service file
+    let service_file = format!("{}/{}.service", service_dir, service.name);
+
+    match scope {
+        ServiceScope::System => {
+            // For system services, write to temp file first then sudo move it
+            let temp_file = format!("/tmp/{}.service", service.name);
+            fs::write(&temp_file, &service.service_definition)?;
+            run_command(&["sudo", "mv", &temp_file, &service_file], &format!("Installing system service {}", service.name))?;
+        }
+        ServiceScope::User => {
+            fs::write(&service_file, &service.service_definition)?;
+        }
+    }
+
+    // Write timer file if present
+    if let Some(timer_def) = &service.timer_definition {
+        let timer_file = format!("{}/{}.timer", service_dir, service.name);
+
+        match scope {
+            ServiceScope::System => {
+                let temp_file = format!("/tmp/{}.timer", service.name);
+                fs::write(&temp_file, timer_def)?;
+                run_command(&["sudo", "mv", &temp_file, &timer_file], &format!("Installing system timer {}", service.name))?;
+            }
+            ServiceScope::User => {
+                fs::write(&timer_file, timer_def)?;
+            }
+        }
+    }
+
+    // Reload systemd
+    match scope {
+        ServiceScope::System => run_command(&["sudo", "systemctl", "daemon-reload"], "Reloading system daemon")?,
+        ServiceScope::User => run_command(&["systemctl", "--user", "daemon-reload"], "Reloading user daemon")?,
+    }
+
+    // Update state
+    state_map.insert(service.name.clone(), CustomServiceInfo {
+        content_hash: content_hash.to_string(),
+        installed_at: get_current_timestamp(),
+    });
+
+    println!("{} Installed custom service: {}", "[SUCCESS]".green(), service.name);
+    Ok(())
+}
+
+fn sync_custom_service_state(service: &CustomService, scope: &ServiceScope, _verbose: bool) -> Result<()> {
+    // Check current service state
+    let is_enabled = check_service_enabled(&service.name, scope)?;
+    let is_active = check_service_active(&service.name, scope)?;
+
+    // Apply desired enabled state
+    if is_enabled != service.enabled {
+        if service.enabled {
+            enable_service(&service.name, scope)?;
+        } else {
+            disable_service(&service.name, scope)?;
+        }
+    }
+
+    // Apply desired started state
+    if is_active != service.started {
+        if service.started {
+            start_service(&service.name, scope)?;
+        } else {
+            stop_service(&service.name, scope)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn check_service_enabled(name: &str, scope: &ServiceScope) -> Result<bool> {
+    let output = match scope {
+        ServiceScope::System => run_command_output(&["systemctl", "is-enabled", name]),
+        ServiceScope::User => run_command_output(&["systemctl", "--user", "is-enabled", name]),
+    };
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout.trim() == "enabled")
+        }
+        Err(_) => Ok(false), // Service doesn't exist or is disabled
+    }
+}
+
+fn check_service_active(name: &str, scope: &ServiceScope) -> Result<bool> {
+    let output = match scope {
+        ServiceScope::System => run_command_output(&["systemctl", "is-active", name]),
+        ServiceScope::User => run_command_output(&["systemctl", "--user", "is-active", name]),
+    };
+
+    match output {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout.trim() == "active")
+        }
+        Err(_) => Ok(false), // Service doesn't exist or is inactive
+    }
+}
+
+fn cleanup_orphaned_custom_services(
+    current_services: &[CustomService],
+    state: &mut CustomServicesState,
+    scope: &ServiceScope,
+    yes: bool,
+    no: bool,
+    verbose: bool,
+) -> Result<()> {
+    let state_map = match scope {
+        ServiceScope::System => &mut state.system_services,
+        ServiceScope::User => &mut state.user_services,
+    };
+
+    let current_names: std::collections::HashSet<_> = current_services.iter().map(|s| &s.name).collect();
+    let orphaned: Vec<_> = state_map.keys().filter(|name| !current_names.contains(name)).cloned().collect();
+
+    if !orphaned.is_empty() {
+        let scope_str = match scope {
+            ServiceScope::System => "system",
+            ServiceScope::User => "user",
+        };
+
+        println!("{} Found {} orphaned custom {} services:", "[INFO]".blue(), orphaned.len(), scope_str);
+        for name in &orphaned {
+            println!("  - {}", name);
+        }
+
+        if ask_user_confirmation(&format!("Remove orphaned custom {} services?", scope_str), yes, no, verbose)? {
+            for name in &orphaned {
+                remove_custom_service(name, scope)?;
+                state_map.remove(name);
+            }
+            println!("{} Removed {} orphaned services", "[SUCCESS]".green(), orphaned.len());
+        }
+    }
+
+    Ok(())
+}
+
+fn remove_custom_service(name: &str, scope: &ServiceScope) -> Result<()> {
+    let service_dir = match scope {
+        ServiceScope::System => "/etc/systemd/system".to_string(),
+        ServiceScope::User => {
+            let home = dirs::home_dir().context("Could not find home directory")?;
+            home.join(".config/systemd/user").to_string_lossy().to_string()
+        }
+    };
+
+    let service_file = format!("{}/{}.service", service_dir, name);
+    let timer_file = format!("{}/{}.timer", service_dir, name);
+
+    // Stop and disable service first
+    let _ = match scope {
+        ServiceScope::System => {
+            let _ = run_command(&["sudo", "systemctl", "stop", name], &format!("Stopping service {}", name));
+            run_command(&["sudo", "systemctl", "disable", name], &format!("Disabling service {}", name))
+        }
+        ServiceScope::User => {
+            let _ = run_command(&["systemctl", "--user", "stop", name], &format!("Stopping service {}", name));
+            run_command(&["systemctl", "--user", "disable", name], &format!("Disabling service {}", name))
+        }
+    };
+
+    // Remove files
+    match scope {
+        ServiceScope::System => {
+            let _ = run_command(&["sudo", "rm", "-f", &service_file], &format!("Removing service file {}", service_file));
+            let _ = run_command(&["sudo", "rm", "-f", &timer_file], &format!("Removing timer file {}", timer_file));
+        }
+        ServiceScope::User => {
+            let _ = fs::remove_file(&service_file);
+            let _ = fs::remove_file(&timer_file);
+        }
+    }
+
+    // Reload systemd
+    match scope {
+        ServiceScope::System => run_command(&["sudo", "systemctl", "daemon-reload"], "Reloading system daemon")?,
+        ServiceScope::User => run_command(&["systemctl", "--user", "daemon-reload"], "Reloading user daemon")?,
+    }
+
+    Ok(())
+}
+
+fn generate_service_hash(service_def: &str, timer_def: &Option<String>) -> Result<String> {
+    let mut hasher = Sha256::new();
+    hasher.update(service_def.trim().as_bytes());
+    if let Some(timer) = timer_def {
+        hasher.update(timer.trim().as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+// ========================= APPLICATION AUTOSTART =========================
+
+fn sync_application_autostart(
+    applications: &HashMap<String, ApplicationAutostart>,
+    yes: bool,
+    no: bool,
+    verbose: bool,
+) -> Result<()> {
+    if verbose {
+        println!("{} Syncing application autostart", "[DEBUG]".cyan());
+    }
+
+    // Convert applications to custom services
+    let mut app_services = Vec::new();
+    for (app_name, app_config) in applications {
+        if let Some(service) = generate_application_service(app_name, app_config)? {
+            app_services.push(service);
+        }
+    }
+
+    if !app_services.is_empty() {
+        sync_custom_services(&app_services, ServiceScope::User, yes, no, verbose)?;
+    }
+
+    Ok(())
+}
+
+fn generate_application_service(app_name: &str, config: &ApplicationAutostart) -> Result<Option<CustomService>> {
+    if !config.enabled {
+        return Ok(None);
+    }
+
+    // Try to find the application executable
+    let executable = find_application_executable(app_name)?;
+
+    // Build command with arguments
+    let mut exec_start = executable.clone();
+    if let Some(args) = &config.args {
+        for arg in args {
+            exec_start.push(' ');
+            exec_start.push_str(arg);
+        }
+    }
+
+    // Build environment variables section
+    let mut environment_section = String::new();
+    if let Some(env_vars) = &config.environment {
+        for (key, value) in env_vars {
+            environment_section.push_str(&format!("Environment={}={}\n", key, value));
+        }
+    }
+
+    // Set restart policy
+    let restart_policy = config.restart_policy.as_deref().unwrap_or("never");
+
+    // Build delay configuration
+    let delay_section = if let Some(delay) = config.delay {
+        format!("ExecStartPre=/bin/sleep {}\n", delay)
+    } else {
+        String::new()
+    };
+
+    let service_definition = format!(
+        r#"[Unit]
+Description={} Autostart
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+{}ExecStart={}
+Restart={}
+{}Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+
+[Install]
+WantedBy=default.target"#,
+        app_name,
+        delay_section,
+        exec_start,
+        restart_policy,
+        environment_section
+    );
+
+    Ok(Some(CustomService {
+        name: format!("{}-autostart", app_name),
+        enabled: true,
+        started: true,
+        service_definition,
+        timer_definition: None,
+    }))
+}
+
+fn find_application_executable(app_name: &str) -> Result<String> {
+    // First try common application paths
+    let common_paths = [
+        format!("/usr/bin/{}", app_name),
+        format!("/usr/local/bin/{}", app_name),
+        format!("/bin/{}", app_name),
+        format!("/opt/{}/bin/{}", app_name, app_name),
+    ];
+
+    for path in &common_paths {
+        if std::path::Path::new(path).exists() {
+            return Ok(path.clone());
+        }
+    }
+
+    // Try using 'which' command
+    let output = run_command_output(&["which", app_name]);
+    if let Ok(output) = output {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() && std::path::Path::new(&path).exists() {
+            return Ok(path);
+        }
+    }
+
+    // Try desktop file lookup for Flatpak and other applications
+    let desktop_file = format!("{}.desktop", app_name);
+    let desktop_paths = [
+        format!("/usr/share/applications/{}", desktop_file),
+        format!("/var/lib/flatpak/exports/share/applications/{}", desktop_file),
+        format!("{}/.local/share/applications/{}",
+                dirs::home_dir().unwrap_or_default().to_string_lossy(), desktop_file),
+    ];
+
+    for desktop_path in &desktop_paths {
+        if std::path::Path::new(desktop_path).exists() {
+            if let Ok(exec_line) = extract_exec_from_desktop_file(desktop_path) {
+                return Ok(exec_line);
+            }
+        }
+    }
+
+    // Fallback: assume it's in PATH
+    Ok(app_name.to_string())
+}
+
+fn extract_exec_from_desktop_file(desktop_file: &str) -> Result<String> {
+    let content = fs::read_to_string(desktop_file)?;
+    for line in content.lines() {
+        if line.starts_with("Exec=") {
+            let exec_line = line.strip_prefix("Exec=").unwrap_or(line);
+            // Remove %u, %f and other desktop file placeholders
+            let cleaned = exec_line
+                .replace("%u", "")
+                .replace("%f", "")
+                .replace("%F", "")
+                .replace("%U", "")
+                .trim()
+                .to_string();
+            return Ok(cleaned);
+        }
+    }
+    anyhow::bail!("No Exec line found in desktop file: {}", desktop_file)
+}
+
+// ========================= CONFIG LOADING AND SAVING =========================
+
+fn load_system_services_config() -> Result<SystemServicesConfig> {
+    let config_content = fs::read_to_string("config/system-services.toml")
+        .with_context(|| "Failed to read config/system-services.toml")?;
+    let config: SystemServicesConfig = toml::from_str(&config_content)
+        .with_context(|| "Failed to parse system-services.toml")?;
+    Ok(config)
+}
+
+fn load_user_services_config() -> Result<UserServicesConfig> {
+    let config_content = fs::read_to_string("config/user-services.toml")
+        .with_context(|| "Failed to read config/user-services.toml")?;
+    let config: UserServicesConfig = toml::from_str(&config_content)
+        .with_context(|| "Failed to parse user-services.toml")?;
+    Ok(config)
+}
+
+fn load_custom_services_state() -> Result<CustomServicesState> {
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    let state_dir = home_dir.join(".config").join("repro-setup");
+    fs::create_dir_all(&state_dir)?;
+    let state_file = state_dir.join("custom_services.json");
+
+    if state_file.exists() {
+        let content = fs::read_to_string(&state_file)?;
+        let state: CustomServicesState = serde_json::from_str(&content)?;
+        Ok(state)
+    } else {
+        Ok(CustomServicesState::default())
+    }
+}
+
+fn save_custom_services_state(state: &CustomServicesState) -> Result<()> {
+    let home_dir = dirs::home_dir().context("Could not find home directory")?;
+    let state_dir = home_dir.join(".config").join("repro-setup");
+    fs::create_dir_all(&state_dir)?;
+    let state_file = state_dir.join("custom_services.json");
+
+    let content = serde_json::to_string_pretty(state)?;
+    fs::write(&state_file, content)?;
+    Ok(())
+}
+
+fn update_services_config_with_discovered(
+    discovered: &[(&String, &CurrentServiceInfo)],
+    config_path: &str,
+    scope: ServiceScope,
+) -> Result<()> {
+    // Create new services map from discovered services
+    let mut new_services = HashMap::new();
+    for (name, info) in discovered {
+        new_services.insert((*name).clone(), ServiceState {
+            enabled: info.enabled,
+            started: info.active,
+        });
+    }
+
+    // Try to read existing config
+    let existing_content = fs::read_to_string(config_path).unwrap_or_else(|_| String::new());
+
+    if existing_content.trim().is_empty() {
+        // Create new config file
+        let config_content = match scope {
+            ServiceScope::System => format!(
+                "# System services configuration\n[services]\n{}",
+                new_services.iter()
+                    .map(|(name, state)| format!(
+                        r#"{} = {{ enabled = {}, started = {} }}"#,
+                        name, state.enabled, state.started
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            ServiceScope::User => format!(
+                "# User services configuration\n[services]\n{}",
+                new_services.iter()
+                    .map(|(name, state)| format!(
+                        r#"{} = {{ enabled = {}, started = {} }}"#,
+                        name, state.enabled, state.started
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        };
+        fs::write(config_path, config_content)?;
+    } else {
+        // Append to existing config
+        let mut content = existing_content;
+        if !content.ends_with('\n') {
+            content.push('\n');
+        }
+
+        for (name, state) in new_services {
+            content.push_str(&format!(
+                r#"{} = {{ enabled = {}, started = {} }}"#,
+                name, state.enabled, state.started
+            ));
+            content.push('\n');
+        }
+
+        fs::write(config_path, content)?;
+    }
+
+    Ok(())
+}
+
+// ========================= INITIAL SETUP SUPPORT =========================
+
+fn generate_initial_services_configs() -> Result<()> {
+    println!("{} Generating services configuration from current state...", "[INFO]".blue());
+
+    // Create config directory if it doesn't exist
+    fs::create_dir_all("config")?;
+
+    // Generate system services config
+    let system_services = get_current_system_services(false)?;
+    let system_enabled: Vec<_> = system_services.iter()
+        .filter(|(_, info)| info.enabled && !info.is_custom)
+        .collect();
+
+    if !system_enabled.is_empty() {
+        update_services_config_with_discovered(&system_enabled, "config/system-services.toml", ServiceScope::System)?;
+        println!("{} Generated config/system-services.toml with {} services", "[SUCCESS]".green(), system_enabled.len());
+    }
+
+    // Generate user services config
+    let user_services = get_current_user_services(false)?;
+    let user_enabled: Vec<_> = user_services.iter()
+        .filter(|(_, info)| info.enabled && !info.is_custom)
+        .collect();
+
+    if !user_enabled.is_empty() {
+        update_services_config_with_discovered(&user_enabled, "config/user-services.toml", ServiceScope::User)?;
+        println!("{} Generated config/user-services.toml with {} services", "[SUCCESS]".green(), user_enabled.len());
+    }
+
+    Ok(())
+}
+

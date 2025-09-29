@@ -1,17 +1,19 @@
-# Reproducible Linux Setup
+# FedoraForge
 
-A powerful Rust-based tool for automating Fedora Linux desktop environment setup with containerized applications and dotfiles management.
+**Forge your perfect Fedora system with declarative configuration**
 
-## 🚀 Features
+FedoraForge is a powerful declarative configuration system for Fedora Linux that enables reproducible, version-controlled system management through simple TOML configuration files. Define your entire system state as code - packages, containers, desktop environment, VPN, and custom commands - then apply changes idempotently.
 
-- **Fedora Support**: Optimized for Fedora Linux with dnf package manager
-- **Dotfiles Management**: Safe migration of `.bashrc` and `.config` directories with backups
-- **Container Management**: Simplified Podman container deployment with flexible flag support
-- **Desktop Environment**: Desktop environment installation and configuration with display manager setup
-- **VPN Integration**: Automated WireGuard and OpenVPN setup with NetworkManager
-- **Package Management**: Modular system and Flatpak package installation from separate TOML files
-- **Custom Commands**: Execute additional shell commands in sequence with run-once support
-- **Interactive Setup**: User confirmation prompts for safe configuration migration
+## 🚀 Declarative Features
+
+- **Pure Configuration**: Define your entire system state in version-controlled TOML files
+- **Idempotent Operations**: Run multiple times safely - only changes what needs changing
+- **Atomic Updates**: Complete system configuration or rollback on failure
+- **Reproducible Builds**: Generate identical systems from the same configuration
+- **Modular Design**: Separate concerns with dedicated files for packages, containers, and system settings
+- **State Tracking**: Intelligent synchronization between declared and actual system state
+- **Drift Detection**: Identify and correct configuration drift from your declared state
+- **Backup Integration**: Automatic backups before any destructive operations
 
 ## 📋 Requirements
 
@@ -19,34 +21,51 @@ A powerful Rust-based tool for automating Fedora Linux desktop environment setup
 - **Dependencies**: `sudo` access for system modifications
 - **Optional**: Podman for container support
 
+### Essential Dependencies
+
+Before building FedoraForge, ensure you have these packages installed:
+
+```bash
+# Install Rust toolchain and Git
+sudo dnf install -y rust cargo git
+
+# Optional: Install development tools group for a complete build environment
+sudo dnf groupinstall -y "Development Tools"
+```
+
+**Alternative Rust Installation:**
+```bash
+# Install Rust via rustup (recommended for latest version)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source ~/.cargo/env
+```
+
 ## 🛠️ Installation
 
 ### From Source
 ```bash
 git clone <repository-url>
-cd repro-setup
+cd fedoraforge
 cargo build --release
 ```
 
-### Quick Setup
+### Declarative Workflow
 ```bash
-# Generate initial configuration from current system state
-./target/release/repro-setup --initial
+# 1. Capture current system state as declarative configuration
+./target/release/fedoraforge --initial
 
-# Run with default configuration (uses config/config.toml)
-./target/release/repro-setup
+# 2. Edit configuration files to declare desired state
+vim config/config.toml
 
-# Run with verbose logging for detailed output
-./target/release/repro-setup --verbose
+# 3. Apply configuration (converge system to declared state)
+./target/release/fedoraforge
 
-# Auto-answer yes to all prompts (unattended mode)
-./target/release/repro-setup --yes
+# 4. Verify system matches declared configuration
+./target/release/fedoraforge --verbose
 
-# Auto-answer no to all prompts (safe mode)
-./target/release/repro-setup --no
-
-# Run with custom config file
-./target/release/repro-setup --config my-config/config.toml
+# Advanced usage
+./target/release/fedoraforge --yes          # Unattended deployment
+./target/release/fedoraforge --config prod.toml  # Environment-specific configs
 ```
 
 ## 🎛️ CLI Options
@@ -58,71 +77,76 @@ cargo build --release
 | `--verbose, -v` | Enable verbose logging for detailed output |
 | `--yes, -y` | Automatically answer yes to all prompts (unattended mode) |
 | `--no, -n` | Automatically answer no to all prompts (safe mode) |
+| `--force-recreate` | Force recreation of all containers |
+| `--update-images` | Update container images and recreate if changed |
+| `--no-recreate` | Never recreate containers (config/systemd only) |
 | `--help, -h` | Show help information |
 | `--version` | Show version information |
 
 **Note**: `--yes` and `--no` flags cannot be used together.
 
-## 📖 Configuration
+## 📖 Declarative Configuration
 
-The setup is controlled via configuration files in the `config/` directory:
+Your entire system is defined through configuration files in the `config/` directory:
 
-- `config/config.toml` - Main configuration file
-- `config/system-packages.toml` - System packages to install via dnf
-- `config/flatpak-packages.toml` - Flatpak applications to install
+- `config/config.toml` - System state declaration (hostname, desktop, containers, VPN, drives)
+- `config/system-packages.toml` - Declared package state (dnf packages)
+- `config/flatpak-packages.toml` - Declared application state (Flatpak apps)
+- `config/system-services.toml` - Declared system services state (systemd services as root)
+- `config/user-services.toml` - Declared user services state (systemd user services)
 
-### Initial Setup
+### Bootstrapping Your Configuration
 
-For first-time setup, use the `--initial` flag to generate package configuration files from your current system:
+Capture your current system state as a declarative configuration:
 
 ```bash
-./target/release/repro-setup --initial
+./target/release/fedoraforge --initial
 ```
 
-This will:
-- Scan your system for user-installed packages using `dnf repoquery --leaves --userinstalled`
-- Scan for installed Flatpak applications using `flatpak list --app`
-- Generate `config/system-packages.toml` and `config/flatpak-packages.toml`
-- Create the `config/` directory structure
+This introspects your system and generates:
+- **Package declarations** from `dnf repoquery --leaves --userinstalled`
+- **Application declarations** from `flatpak list --app`
+- **Service declarations** from `systemctl list-unit-files` (system and user)
+- **Base configuration structure** in `config/`
 
-After running `--initial`, create your main `config/config.toml` file and run the tool again without the flag.
+Once generated, your system state becomes code - edit the TOML files to declare your desired state, then apply changes with a simple `./fedoraforge` command.
 
 Here's the structure:
 
-### Main Configuration (config/config.toml)
+### System State Declaration (config/config.toml)
 ```toml
+# Declare target distribution
 distro = "fedora"
 
+# Declare system configuration
 [system]
-hostname = "my-desktop"
-enable_amd_gpu = false
-enable_rpm_fusion = true
+hostname = "my-workstation"      # Desired hostname
+enable_amd_gpu = false           # GPU driver state
+enable_rpm_fusion = true        # Repository state
 
+# Declare desktop environment state
 [desktop]
-environment = "cosmic-desktop"
-packages = ["cosmic-desktop-apps"]
-display_manager = "gdm"
+environment = "cosmic-desktop"   # Desired desktop environment
+packages = ["cosmic-desktop-apps"]  # Required desktop packages
+display_manager = "gdm"          # Login manager
 
+# Declare application repositories
 [flatpak]
 [[flatpak.remotes]]
 name = "flathub"
 url = "https://flathub.org/repo/flathub.flatpakrepo"
-
-[[flatpak.remotes]]
-name = "flathub-beta"
-url = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo"
 ```
 
-### System Packages (config/system-packages.toml)
+### Package State Declaration (config/system-packages.toml)
 ```toml
-# System packages to install via dnf
+# Declare desired system packages (managed via dnf)
 packages = [
-    "podman",
-    "git",
-    "curl",
-    "htop",
-    "vim",
-    "btop"
+    "podman",     # Container runtime
+    "git",        # Version control
+    "curl",       # HTTP client
+    "htop",       # Process monitor
+    "vim",        # Text editor
+    "neovim"      # Modern vim
 ]
 ```
 
@@ -140,12 +164,12 @@ name = "flathub-beta"
 url = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo"
 ```
 
-#### Packages (config/flatpak-packages.toml)
+#### Application State Declaration (config/flatpak-packages.toml)
 ```toml
-# Flatpak applications to install
+# Declare desired Flatpak applications
 packages = [
-    "io.gitlab.librewolf-community",          # From flathub (default)
-    "flathub-beta:com.valvesoftware.Steam"    # From flathub-beta (specify remote)
+    "io.gitlab.librewolf-community",          # Privacy-focused browser
+    "flathub-beta:com.valvesoftware.Steam"    # Gaming platform (beta)
 ]
 ```
 
@@ -175,24 +199,110 @@ display_manager = "gdm"  # Options: gdm, lightdm, sddm, cosmic-greeter
 - `sddm` - Simple Desktop Display Manager (KDE's default)
 - `cosmic-greeter` - Native COSMIC display manager (in development)
 
-### Container Configuration
+### Container State Declaration
 ```toml
 [podman]
-containers = [
-    # Brave Browser
-    { name = "brave",
-      image = "lscr.io/linuxserver/brave:latest",
-      raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -e PGID=1000 -p 3100:3000 -p 3101:3001 -v $HOME/.config/brave:/config --shm-size=1gb --restart unless-stopped",
-      start_after_creation = true,
-      autostart = true },
-
-    # Librewolf Browser
-    { name = "librewolf",
-      image = "lscr.io/linuxserver/librewolf:latest",
-      raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -e PGID=1000 -p 3000:3000 -p 3001:3001 -v $HOME/.config/librewolf:/config --shm-size=1gb --restart unless-stopped",
-      start_after_creation = true,
-      autostart = true }
+# Commands to run before container setup
+pre_container_setup = [
+    { description = "Create config directory", command = "mkdir -p $HOME/.config/librewolf" }
 ]
+
+# Declare desired container state
+[[podman.containers]]
+name = "librewolf"
+image = "lscr.io/linuxserver/librewolf:latest"
+raw_flags = "--security-opt seccomp=unconfined -e PUID=1000 -p 3000:3000 -v $HOME/.config/librewolf:/config --restart unless-stopped"
+autostart = true      # Declare autostart behavior via systemd
+start_after_creation = false
+```
+
+### Drive Configuration
+```toml
+[[drives]]
+device = "/dev/sdb1"
+mount_point = "/mnt/data"
+encrypted = false
+filesystem = "ext4"
+label = "data-drive"
+force_update = false
+```
+
+### Services Configuration
+
+#### System Services (config/system-services.toml)
+```toml
+# System services (run as root)
+[services]
+sshd = { enabled = true, started = true }
+NetworkManager = { enabled = true, started = true }
+firewalld = { enabled = true, started = true }
+cups = { enabled = false, started = false }
+
+# Custom system services (defined declaratively)
+[[custom_services]]
+name = "backup-service"
+enabled = true
+started = false  # Only run when triggered by timer
+service_definition = """
+[Unit]
+Description=System Backup Service
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/backup.sh
+User=backup
+
+[Install]
+WantedBy=multi-user.target
+"""
+# Optional timer for scheduled execution
+timer_definition = """
+[Unit]
+Description=Daily Backup Timer
+Requires=backup-service.service
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+```
+
+#### User Services (config/user-services.toml)
+```toml
+# User services (run as current user)
+[services]
+"podman.socket" = { enabled = true, started = true }
+"pipewire.service" = { enabled = true, started = true }
+
+# Application autostart (automatically creates systemd user services)
+[applications]
+cosmic-term = { enabled = true, restart_policy = "never", delay = 2 }
+firefox = { enabled = true, restart_policy = "never", delay = 5 }
+discord = { enabled = false, restart_policy = "on-failure" }
+
+# Custom user services
+[[custom_services]]
+name = "dev-server"
+enabled = true
+started = true
+service_definition = """
+[Unit]
+Description=Development Server
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/bin/dev-server
+Restart=always
+Environment=NODE_ENV=development
+
+[Install]
+WantedBy=default.target
+"""
 ```
 
 ### VPN Configuration (WireGuard or OpenVPN)
@@ -214,21 +324,20 @@ The tool will automatically:
 - Enable autoconnect for the VPN connection
 - Handle Fedora version compatibility issues gracefully
 
-### Custom Commands
+### Command State Declaration
 ```toml
 [custom_commands]
-# Regular commands that run every time
+# Commands that enforce state every run
 commands = [
-    "mkdir -p $HOME/.local/bin",
-    "git config --global user.name 'Your Name'",
-    "systemctl --user enable --now podman.socket"
+    "mkdir -p $HOME/.local/bin",                    # Ensure directory exists
+    "git config --global user.name 'Your Name'",   # Ensure git config
+    "systemctl --user enable --now podman.socket"  # Ensure service state
 ]
 
-# Commands that only run once (tracked via SHA-256 hash in ~/.config/repro-setup/executed_commands.json)
+# One-time initialization commands (idempotent via hash tracking)
 run_once = [
     "curl -o ~/.local/bin/my-script https://example.com/script.sh && chmod +x ~/.local/bin/my-script",
-    "git clone https://github.com/user/dotfiles ~/.dotfiles",
-    "pip install --user some-package"
+    "git clone https://github.com/user/dotfiles ~/.dotfiles"
 ]
 ```
 
@@ -240,6 +349,9 @@ run_once = [
 - ✅ Additional repositories (RPM Fusion)
 - ✅ AMD GPU drivers (optional)
 - ✅ Flatpak with Flathub and package installation from `config/flatpak-packages.toml`
+- ✅ System and user services management from `config/system-services.toml` and `config/user-services.toml`
+- ✅ Custom service definition and deployment (systemd services defined declaratively)
+- ✅ Application autostart management (automatically creates systemd user services for applications)
 
 ### Desktop Environment
 - ✅ Desktop environment package installation (COSMIC, GNOME, KDE, etc.)
@@ -265,7 +377,7 @@ run_once = [
 ### Basic Desktop Setup
 ```bash
 # Configure distro and basic packages
-./repro-setup
+./fedoraforge
 ```
 
 ### Container-Only Setup
@@ -273,14 +385,14 @@ run_once = [
 # Disable other features, focus on containers
 # Edit config.toml to set start_after_creation = true for immediate start
 # Set autostart = true for boot-time autostart via Quadlet
-./repro-setup
+./fedoraforge
 ```
 
 ### Dotfiles Migration
 ```bash
 # The tool will prompt before overwriting existing configs
 # Creates backups like .bashrc.backup, nvim.backup, etc.
-./repro-setup
+./fedoraforge
 ```
 
 ## 🌐 Container Access
@@ -322,7 +434,7 @@ podman logs <container-name>
 **Config Validation**
 ```bash
 # Test config parsing
-./repro-setup --config config.toml --help
+./fedoraforge --config config.toml --help
 ```
 
 ## 📝 Configuration Templates
@@ -394,6 +506,25 @@ packages = [
 ]
 ```
 
+**Full System Services (config/system-services.toml):**
+```toml
+[services]
+sshd = { enabled = true, started = true }
+NetworkManager = { enabled = true, started = true }
+firewalld = { enabled = true, started = true }
+```
+
+**Full User Services (config/user-services.toml):**
+```toml
+[services]
+"podman.socket" = { enabled = true, started = true }
+"pipewire.service" = { enabled = true, started = true }
+
+[applications]
+cosmic-term = { enabled = true, restart_policy = "never", delay = 2 }
+firefox = { enabled = true, restart_policy = "never", delay = 5 }
+```
+
 ## 🤝 Contributing
 
 1. Fork the repository
@@ -414,24 +545,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ---
 
-**Note**: This tool modifies system configurations. Always review the `config.toml` before running and ensure you have backups of important data.
+**Note**: FedoraForge modifies system configurations. Always review the `config.toml` before running and ensure you have backups of important data.
 
-## TODO
-- Automatic System update
-- define custom systemd services in the config
-- Keep containers up to date
-- Support for building and managing locally built podman containers
-- Integrate VM generation
-- Cosmic Desktop management using config.toml
-- Integrate WinApps Docker or Bottles
-- Optimize
-- Refactor application to supress command outputs with debug
-- Flatpak applications in App Menu
-- Don't attempt to re-create podman pre_container_setup commands (combine with  run once commands)
-- Only run what was changed
-- Drop bear support
-- System installation script (useful for arch linux and fedora minimal installations. define partitions to be read, setup users, etc)
-- application autostart management
-- Integrate into Cockpit? Some functionality? Can some of cockpits functionality replace what is needed by this program such as system updates?
-- Service to keep everything in sync (packages)
-- Intent of this application is to easily keep a config file of a systems core functionality that can easily be setup onto another machine with minimal setup time. virtually creating a migratible system config. the system should keep the settings in sync with the system. the application should also allow custom configurations declartively using the config files which is useful when spinning up new machines with new purposes
+---
+
+**FedoraForge - Forge your perfect Fedora system** 🔥
+
