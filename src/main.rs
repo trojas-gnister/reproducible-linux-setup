@@ -278,6 +278,27 @@ fn main() -> Result<()> {
         });
         update_flatpak_packages_file(&flatpak_packages)?;
 
+        // Generate pip packages config
+        let pip_packages = get_installed_pip_packages().unwrap_or_else(|_| {
+            println!("{} pip not available or no packages installed", "[WARN]".yellow());
+            Vec::new()
+        });
+        update_pip_packages_file(&pip_packages)?;
+
+        // Generate npm packages config
+        let npm_packages = get_installed_npm_packages().unwrap_or_else(|_| {
+            println!("{} npm not available or no packages installed", "[WARN]".yellow());
+            Vec::new()
+        });
+        update_npm_packages_file(&npm_packages)?;
+
+        // Generate cargo packages config
+        let cargo_packages = get_installed_cargo_packages().unwrap_or_else(|_| {
+            println!("{} cargo not available or no packages installed", "[WARN]".yellow());
+            Vec::new()
+        });
+        update_cargo_packages_file(&cargo_packages)?;
+
         // Generate services config
         generate_initial_services_configs()?;
 
@@ -346,6 +367,15 @@ fn main() -> Result<()> {
 
     // Synchronize Flatpak packages with installed applications
     let _flatpak_packages = sync_flatpak_packages(args.yes, args.no, args.verbose)?;
+
+    // Synchronize pip packages with installed packages
+    let _pip_packages = sync_pip_packages(args.yes, args.no, args.verbose)?;
+
+    // Synchronize npm packages with installed packages
+    let _npm_packages = sync_npm_packages(args.yes, args.no, args.verbose)?;
+
+    // Synchronize cargo packages with installed binaries
+    let _cargo_packages = sync_cargo_packages(args.yes, args.no, args.verbose)?;
 
     // Synchronize services with system state
     sync_services(args.yes, args.no, args.verbose)?;
@@ -937,6 +967,391 @@ fn sync_flatpak_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<Strin
     println!("  - Removed: {} applications", flatpaks_to_remove.len());
 
     Ok(config_flatpaks)
+}
+
+// ========== Pip Package Management ==========
+
+fn get_installed_pip_packages() -> Result<Vec<String>> {
+    println!("{} Getting list of installed pip packages...", "[INFO]".blue());
+
+    let output = Command::new("pip")
+        .args(&["list", "--format=freeze", "--user"])
+        .output()
+        .context("Failed to run pip list command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("pip list failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut packages: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // Parse "package==version" format and extract package name
+            line.split("==").next().map(|s| s.to_string())
+        })
+        .collect();
+
+    packages.sort();
+    packages.dedup();
+
+    println!("{} Found {} installed pip packages", "[INFO]".blue(), packages.len());
+    Ok(packages)
+}
+
+fn install_pip_packages(packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+
+    println!("{} Installing {} pip packages...", "[INFO]".blue(), packages.len());
+    for pkg in packages {
+        run_command(&["pip", "install", "--user", pkg], &format!("Installing pip package {}", pkg))?;
+    }
+
+    Ok(())
+}
+
+fn update_pip_packages_file(packages: &[String]) -> Result<()> {
+    let package_list = PackageList {
+        packages: packages.to_vec(),
+    };
+
+    let content = format!("# Python packages to install via pip\n# List user-installed packages here\n{}",
+        toml::to_string_pretty(&package_list)
+        .context("Failed to serialize pip package list to TOML")?);
+
+    fs::write("config/pip-packages.toml", content)
+        .context("Failed to write pip-packages.toml file")?;
+
+    println!("{} Updated config/pip-packages.toml with {} packages", "[SUCCESS]".green(), packages.len());
+    Ok(())
+}
+
+fn sync_pip_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String>> {
+    println!("{} Synchronizing pip packages with installed packages...", "[INFO]".blue());
+
+    // Get currently installed pip packages
+    let installed_packages = get_installed_pip_packages()?;
+
+    // Load packages from config file
+    let mut config_packages = load_package_list("config/pip-packages.toml")?;
+
+    // Find packages to install (in config but not installed)
+    let mut packages_to_install = Vec::new();
+    for pkg in &config_packages {
+        if !installed_packages.contains(pkg) {
+            packages_to_install.push(pkg.clone());
+        }
+    }
+
+    // Find packages to potentially remove (installed but not in config)
+    let mut packages_to_keep = Vec::new();
+    let mut packages_to_remove = Vec::new();
+
+    for pkg in &installed_packages {
+        if !config_packages.contains(pkg) {
+            println!("\n{} Pip package '{}' is installed but not in pip-packages.toml", "[INFO]".yellow(), pkg);
+            if ask_user_confirmation(&format!("Do you want to keep '{}' installed?", pkg), yes, no, verbose)? {
+                packages_to_keep.push(pkg.clone());
+                config_packages.push(pkg.clone());
+            } else {
+                packages_to_remove.push(pkg.clone());
+            }
+        }
+    }
+
+    // Install missing packages
+    if !packages_to_install.is_empty() {
+        println!("{} Installing {} pip packages from config...", "[INFO]".blue(), packages_to_install.len());
+        install_pip_packages(&packages_to_install)?;
+    }
+
+    // Remove unwanted packages
+    if !packages_to_remove.is_empty() {
+        println!("{} Removing {} unwanted pip packages...", "[INFO]".blue(), packages_to_remove.len());
+        for pkg in &packages_to_remove {
+            run_command(&["pip", "uninstall", "-y", pkg], &format!("Removing pip package {}", pkg))?;
+        }
+    }
+
+    // Update config file if there were changes
+    if !packages_to_keep.is_empty() || !packages_to_remove.is_empty() {
+        config_packages.sort();
+        config_packages.dedup();
+        update_pip_packages_file(&config_packages)?;
+    }
+
+    println!("{} Pip synchronization completed", "[SUCCESS]".green());
+    println!("  - Installed: {} packages", packages_to_install.len());
+    println!("  - Kept: {} packages", packages_to_keep.len());
+    println!("  - Removed: {} packages", packages_to_remove.len());
+
+    Ok(config_packages)
+}
+
+// ========== NPM Package Management ==========
+
+fn get_installed_npm_packages() -> Result<Vec<String>> {
+    println!("{} Getting list of globally installed npm packages...", "[INFO]".blue());
+
+    let output = Command::new("npm")
+        .args(&["list", "-g", "--depth=0", "--json"])
+        .output()
+        .context("Failed to run npm list command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("npm list failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse JSON output
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .context("Failed to parse npm list JSON output")?;
+
+    let mut packages = Vec::new();
+    if let Some(deps) = json.get("dependencies").and_then(|d| d.as_object()) {
+        for (pkg_name, _) in deps {
+            // Skip npm itself
+            if pkg_name != "npm" {
+                packages.push(pkg_name.clone());
+            }
+        }
+    }
+
+    packages.sort();
+    packages.dedup();
+
+    println!("{} Found {} globally installed npm packages", "[INFO]".blue(), packages.len());
+    Ok(packages)
+}
+
+fn install_npm_packages(packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+
+    println!("{} Installing {} npm packages globally...", "[INFO]".blue(), packages.len());
+    for pkg in packages {
+        run_command(&["npm", "install", "-g", pkg], &format!("Installing npm package {}", pkg))?;
+    }
+
+    Ok(())
+}
+
+fn update_npm_packages_file(packages: &[String]) -> Result<()> {
+    let package_list = PackageList {
+        packages: packages.to_vec(),
+    };
+
+    let content = format!("# Node.js global packages to install via npm\n# List globally installed packages here\n{}",
+        toml::to_string_pretty(&package_list)
+        .context("Failed to serialize npm package list to TOML")?);
+
+    fs::write("config/npm-packages.toml", content)
+        .context("Failed to write npm-packages.toml file")?;
+
+    println!("{} Updated config/npm-packages.toml with {} packages", "[SUCCESS]".green(), packages.len());
+    Ok(())
+}
+
+fn sync_npm_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String>> {
+    println!("{} Synchronizing npm packages with installed packages...", "[INFO]".blue());
+
+    // Get currently installed npm packages
+    let installed_packages = get_installed_npm_packages()?;
+
+    // Load packages from config file
+    let mut config_packages = load_package_list("config/npm-packages.toml")?;
+
+    // Find packages to install (in config but not installed)
+    let mut packages_to_install = Vec::new();
+    for pkg in &config_packages {
+        if !installed_packages.contains(pkg) {
+            packages_to_install.push(pkg.clone());
+        }
+    }
+
+    // Find packages to potentially remove (installed but not in config)
+    let mut packages_to_keep = Vec::new();
+    let mut packages_to_remove = Vec::new();
+
+    for pkg in &installed_packages {
+        if !config_packages.contains(pkg) {
+            println!("\n{} npm package '{}' is installed but not in npm-packages.toml", "[INFO]".yellow(), pkg);
+            if ask_user_confirmation(&format!("Do you want to keep '{}' installed?", pkg), yes, no, verbose)? {
+                packages_to_keep.push(pkg.clone());
+                config_packages.push(pkg.clone());
+            } else {
+                packages_to_remove.push(pkg.clone());
+            }
+        }
+    }
+
+    // Install missing packages
+    if !packages_to_install.is_empty() {
+        println!("{} Installing {} npm packages from config...", "[INFO]".blue(), packages_to_install.len());
+        install_npm_packages(&packages_to_install)?;
+    }
+
+    // Remove unwanted packages
+    if !packages_to_remove.is_empty() {
+        println!("{} Removing {} unwanted npm packages...", "[INFO]".blue(), packages_to_remove.len());
+        for pkg in &packages_to_remove {
+            run_command(&["npm", "uninstall", "-g", pkg], &format!("Removing npm package {}", pkg))?;
+        }
+    }
+
+    // Update config file if there were changes
+    if !packages_to_keep.is_empty() || !packages_to_remove.is_empty() {
+        config_packages.sort();
+        config_packages.dedup();
+        update_npm_packages_file(&config_packages)?;
+    }
+
+    println!("{} npm synchronization completed", "[SUCCESS]".green());
+    println!("  - Installed: {} packages", packages_to_install.len());
+    println!("  - Kept: {} packages", packages_to_keep.len());
+    println!("  - Removed: {} packages", packages_to_remove.len());
+
+    Ok(config_packages)
+}
+
+// ========== Cargo Package Management ==========
+
+fn get_installed_cargo_packages() -> Result<Vec<String>> {
+    println!("{} Getting list of cargo-installed binaries...", "[INFO]".blue());
+
+    let output = Command::new("cargo")
+        .args(&["install", "--list"])
+        .output()
+        .context("Failed to run cargo install --list command")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("cargo install --list failed: {}", stderr);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut packages = Vec::new();
+
+    // Parse cargo install --list output
+    // Format: "package_name v0.1.0:"
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(' ') {
+            continue;
+        }
+
+        // Extract package name (before the version)
+        if let Some(pkg_name) = line.split_whitespace().next() {
+            packages.push(pkg_name.to_string());
+        }
+    }
+
+    packages.sort();
+    packages.dedup();
+
+    println!("{} Found {} cargo-installed binaries", "[INFO]".blue(), packages.len());
+    Ok(packages)
+}
+
+fn install_cargo_packages(packages: &[String]) -> Result<()> {
+    if packages.is_empty() {
+        return Ok(());
+    }
+
+    println!("{} Installing {} cargo packages...", "[INFO]".blue(), packages.len());
+    for pkg in packages {
+        run_command(&["cargo", "install", pkg], &format!("Installing cargo package {}", pkg))?;
+    }
+
+    Ok(())
+}
+
+fn update_cargo_packages_file(packages: &[String]) -> Result<()> {
+    let package_list = PackageList {
+        packages: packages.to_vec(),
+    };
+
+    let content = format!("# Rust binaries to install via cargo\n# List cargo-installed binaries here\n{}",
+        toml::to_string_pretty(&package_list)
+        .context("Failed to serialize cargo package list to TOML")?);
+
+    fs::write("config/cargo-packages.toml", content)
+        .context("Failed to write cargo-packages.toml file")?;
+
+    println!("{} Updated config/cargo-packages.toml with {} packages", "[SUCCESS]".green(), packages.len());
+    Ok(())
+}
+
+fn sync_cargo_packages(yes: bool, no: bool, verbose: bool) -> Result<Vec<String>> {
+    println!("{} Synchronizing cargo packages with installed binaries...", "[INFO]".blue());
+
+    // Get currently installed cargo packages
+    let installed_packages = get_installed_cargo_packages()?;
+
+    // Load packages from config file
+    let mut config_packages = load_package_list("config/cargo-packages.toml")?;
+
+    // Find packages to install (in config but not installed)
+    let mut packages_to_install = Vec::new();
+    for pkg in &config_packages {
+        if !installed_packages.contains(pkg) {
+            packages_to_install.push(pkg.clone());
+        }
+    }
+
+    // Find packages to potentially remove (installed but not in config)
+    let mut packages_to_keep = Vec::new();
+    let mut packages_to_remove = Vec::new();
+
+    for pkg in &installed_packages {
+        if !config_packages.contains(pkg) {
+            println!("\n{} Cargo package '{}' is installed but not in cargo-packages.toml", "[INFO]".yellow(), pkg);
+            if ask_user_confirmation(&format!("Do you want to keep '{}' installed?", pkg), yes, no, verbose)? {
+                packages_to_keep.push(pkg.clone());
+                config_packages.push(pkg.clone());
+            } else {
+                packages_to_remove.push(pkg.clone());
+            }
+        }
+    }
+
+    // Install missing packages
+    if !packages_to_install.is_empty() {
+        println!("{} Installing {} cargo packages from config...", "[INFO]".blue(), packages_to_install.len());
+        install_cargo_packages(&packages_to_install)?;
+    }
+
+    // Remove unwanted packages
+    if !packages_to_remove.is_empty() {
+        println!("{} Removing {} unwanted cargo packages...", "[INFO]".blue(), packages_to_remove.len());
+        for pkg in &packages_to_remove {
+            run_command(&["cargo", "uninstall", pkg], &format!("Removing cargo package {}", pkg))?;
+        }
+    }
+
+    // Update config file if there were changes
+    if !packages_to_keep.is_empty() || !packages_to_remove.is_empty() {
+        config_packages.sort();
+        config_packages.dedup();
+        update_cargo_packages_file(&config_packages)?;
+    }
+
+    println!("{} Cargo synchronization completed", "[SUCCESS]".green());
+    println!("  - Installed: {} packages", packages_to_install.len());
+    println!("  - Kept: {} packages", packages_to_keep.len());
+    println!("  - Removed: {} packages", packages_to_remove.len());
+
+    Ok(config_packages)
 }
 
 fn detect_distro(os_release: &str) -> Result<Distro> {

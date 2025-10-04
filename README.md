@@ -92,6 +92,9 @@ Your entire system is defined through configuration files in the `config/` direc
 - `config/config.toml` - System state declaration (hostname, desktop, containers, VPN, drives)
 - `config/system-packages.toml` - Declared package state (dnf packages)
 - `config/flatpak-packages.toml` - Declared application state (Flatpak apps)
+- `config/pip-packages.toml` - Declared Python packages (pip)
+- `config/npm-packages.toml` - Declared Node.js packages (npm global)
+- `config/cargo-packages.toml` - Declared Rust binaries (cargo install)
 - `config/system-services.toml` - Declared system services state (systemd services as root)
 - `config/user-services.toml` - Declared user services state (systemd user services)
 
@@ -170,6 +173,38 @@ url = "https://flathub.org/beta-repo/flathub-beta.flatpakrepo"
 packages = [
     "io.gitlab.librewolf-community",          # Privacy-focused browser
     "flathub-beta:com.valvesoftware.Steam"    # Gaming platform (beta)
+]
+```
+
+### Language Package Managers
+
+#### Python Packages (config/pip-packages.toml)
+```toml
+# Declare desired Python packages (installed via pip --user)
+packages = [
+    "pipx",          # Python application installer
+    "black",         # Code formatter
+    "pytest",        # Testing framework
+]
+```
+
+#### Node.js Packages (config/npm-packages.toml)
+```toml
+# Declare desired global npm packages
+packages = [
+    "typescript",    # TypeScript compiler
+    "eslint",        # JavaScript linter
+    "prettier",      # Code formatter
+]
+```
+
+#### Rust Binaries (config/cargo-packages.toml)
+```toml
+# Declare desired Rust binaries (installed via cargo install)
+packages = [
+    "ripgrep",       # Fast grep alternative
+    "fd-find",       # Fast find alternative
+    "bat",           # Cat with syntax highlighting
 ]
 ```
 
