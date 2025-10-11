@@ -176,6 +176,7 @@ struct WinAppsConfig {
     debug: Option<bool>,
     multimon: Option<bool>,
     rdp_flags: Option<String>,
+    rdp_env: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default)]
@@ -1769,6 +1770,32 @@ fn setup_winapps(enable_winapps: bool, args: &Args) -> Result<()> {
         conf_content.push_str(&format!("RDP_FLAGS=\"{}\"\n", rdp_flags));
     }
 
+    // Detect Wayland and set RDP_ENV for compatibility
+    let rdp_env = if let Some(custom_env) = &winapps_config.rdp_env {
+        // Use custom environment from config if specified
+        custom_env.clone()
+    } else {
+        // Auto-detect Wayland session
+        if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
+            if session_type.to_lowercase() == "wayland" {
+                println!("{} Detected Wayland session, setting GDK_BACKEND=x11 for FreeRDP compatibility", "[INFO]".blue());
+                "GDK_BACKEND=x11".to_string()
+            } else {
+                String::new()
+            }
+        } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
+            // Fallback check for Wayland
+            println!("{} Detected Wayland display, setting GDK_BACKEND=x11 for FreeRDP compatibility", "[INFO]".blue());
+            "GDK_BACKEND=x11".to_string()
+        } else {
+            String::new()
+        }
+    };
+
+    if !rdp_env.is_empty() {
+        conf_content.push_str(&format!("RDP_ENV=\"{}\"\n", rdp_env));
+    }
+
     fs::write(&winapps_conf_path, conf_content)
         .with_context(|| format!("Failed to write WinApps config to {:?}", winapps_conf_path))?;
 
@@ -1844,6 +1871,13 @@ fn setup_winapps(enable_winapps: bool, args: &Args) -> Result<()> {
     println!("  • Install the winapps binary");
     println!("  • Let you select which Windows applications to expose");
     println!("  • Create desktop shortcuts for selected apps");
+
+    if !rdp_env.is_empty() {
+        println!("\n{} Wayland Compatibility Configured:", "🖥️".blue());
+        println!("  • Detected Wayland session");
+        println!("  • Automatically configured: {}", rdp_env);
+        println!("  • This fixes FreeRDP X11 compatibility issues");
+    }
 
     println!("\n{} Configuration saved to: {:?}", "✅".green(), winapps_conf_path);
     println!("{} ═══════════════════════════════════════════════════════════════\n", "📋".blue());
