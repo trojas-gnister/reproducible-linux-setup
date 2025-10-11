@@ -71,6 +71,7 @@ struct SystemConfig {
     hostname: Option<String>,
     enable_amd_gpu: bool,
     enable_rpm_fusion: bool,
+    enable_winapps: bool,
 }
 
 #[derive(Deserialize, Debug)]
@@ -162,6 +163,21 @@ struct CustomCommandsConfig {
     run_once: Option<Vec<String>>,
 }
 
+#[derive(Deserialize, Debug)]
+struct WinAppsConfig {
+    rdp_user: String,
+    rdp_pass: String,
+    rdp_domain: Option<String>,
+    rdp_ip: String,
+    vm_name: Option<String>,
+    waflavor: String,
+    rdp_scale: Option<String>,
+    removable_media: Option<String>,
+    debug: Option<bool>,
+    multimon: Option<bool>,
+    rdp_flags: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct ExecutedCommandsState {
     executed_once_commands: HashMap<String, CommandExecutionRecord>,
@@ -172,6 +188,12 @@ struct CommandExecutionRecord {
     command_hash: String,
     original_command: String,
     executed_at: u64, // Unix timestamp
+}
+
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct DotfilesState {
+    bashrc_hash: Option<String>,
+    config_dirs: HashMap<String, String>, // dir_name -> hash
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -366,16 +388,28 @@ fn main() -> Result<()> {
     setup_flatpak(&config.distro, config.flatpak.as_ref(), args.verbose)?;
 
     // Synchronize Flatpak packages with installed applications
-    let _flatpak_packages = sync_flatpak_packages(args.yes, args.no, args.verbose)?;
+    let _flatpak_packages = sync_flatpak_packages(args.yes, args.no, args.verbose).unwrap_or_else(|e| {
+        println!("{} Flatpak synchronization failed: {}", "[WARNING]".yellow(), e);
+        Vec::new()
+    });
 
     // Synchronize pip packages with installed packages
-    let _pip_packages = sync_pip_packages(args.yes, args.no, args.verbose)?;
+    let _pip_packages = sync_pip_packages(args.yes, args.no, args.verbose).unwrap_or_else(|e| {
+        println!("{} pip synchronization skipped: {}", "[WARNING]".yellow(), e);
+        Vec::new()
+    });
 
     // Synchronize npm packages with installed packages
-    let _npm_packages = sync_npm_packages(args.yes, args.no, args.verbose)?;
+    let _npm_packages = sync_npm_packages(args.yes, args.no, args.verbose).unwrap_or_else(|e| {
+        println!("{} npm synchronization skipped: {}", "[WARNING]".yellow(), e);
+        Vec::new()
+    });
 
     // Synchronize cargo packages with installed binaries
-    let _cargo_packages = sync_cargo_packages(args.yes, args.no, args.verbose)?;
+    let _cargo_packages = sync_cargo_packages(args.yes, args.no, args.verbose).unwrap_or_else(|e| {
+        println!("{} cargo synchronization skipped: {}", "[WARNING]".yellow(), e);
+        Vec::new()
+    });
 
     // Synchronize services with system state
     sync_services(args.yes, args.no, args.verbose)?;
@@ -446,6 +480,9 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
         }
     }
 
+    // WinApps setup
+    setup_winapps(config.system.enable_winapps, &args)?;
+
     // Dotfiles setup
     if let Some(dotfiles) = &config.dotfiles {
         setup_dotfiles(dotfiles, args.yes, args.no, args.verbose)?;
@@ -502,32 +539,57 @@ fn setup_dotfiles(config: &DotfilesConfig, yes: bool, no: bool, verbose: bool) -
     let current_dir = env::current_dir()?;
     let home_dir = dirs::home_dir().context("Could not find home directory")?;
 
+    // Load dotfiles state
+    let mut state = load_dotfiles_state()?;
+
     // Setup .bashrc
     if config.setup_bashrc {
-        setup_bashrc(&current_dir, &home_dir, yes, no, verbose)?;
+        setup_bashrc(&current_dir, &home_dir, &mut state, yes, no, verbose)?;
     }
 
     // Setup .config directories
     if config.setup_config_dirs {
-        setup_config_dirs(&current_dir, &home_dir, yes, no, verbose)?;
+        setup_config_dirs(&current_dir, &home_dir, &mut state, yes, no, verbose)?;
     }
+
+    // Save updated state
+    save_dotfiles_state(&state)?;
 
     println!("{} Dotfiles setup completed!", "[SUCCESS]".green());
     Ok(())
 }
 
-fn setup_bashrc(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbose: bool) -> Result<()> {
+fn setup_bashrc(project_dir: &Path, home_dir: &Path, state: &mut DotfilesState, yes: bool, no: bool, verbose: bool) -> Result<()> {
     let project_bashrc = project_dir.join(".bashrc");
     let home_bashrc = home_dir.join(".bashrc");
 
     if !project_bashrc.exists() {
-        println!("{} No .bashrc found in project directory, skipping", "[WARN]".yellow());
+        if verbose {
+            println!("{} No .bashrc found in project directory, skipping", "[DEBUG]".cyan());
+        }
         return Ok(());
     }
 
+    // Generate hash of project .bashrc
+    let project_hash = generate_file_hash(&project_bashrc)?;
+
+    // Check if home .bashrc exists and matches
     if home_bashrc.exists() {
-        println!("{} Found existing .bashrc in home directory", "[INFO]".blue());
-        if ask_user_confirmation("Do you want to replace your existing .bashrc with the one from this project?", yes, no, verbose)? {
+        let home_hash = generate_file_hash(&home_bashrc)?;
+
+        // Compare with stored state
+        if let Some(stored_hash) = &state.bashrc_hash {
+            if stored_hash == &project_hash && &home_hash == &project_hash {
+                if verbose {
+                    println!("{} .bashrc is up to date, skipping", "[DEBUG]".cyan());
+                }
+                return Ok(());
+            }
+        }
+
+        // Files differ - ask to update
+        println!("{} .bashrc has changed since last sync", "[INFO]".blue());
+        if ask_user_confirmation("Do you want to update your .bashrc with the version from this project?", yes, no, verbose)? {
             // Backup existing .bashrc
             let backup_path = home_dir.join(".bashrc.backup");
             fs::copy(&home_bashrc, &backup_path)
@@ -537,26 +599,30 @@ fn setup_bashrc(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbos
             // Copy project .bashrc
             fs::copy(&project_bashrc, &home_bashrc)
                 .context("Failed to copy project .bashrc")?;
-            println!("{} Successfully replaced .bashrc", "[SUCCESS]".green());
+            state.bashrc_hash = Some(project_hash);
+            println!("{} Successfully updated .bashrc", "[SUCCESS]".green());
         } else {
-            println!("{} Skipping .bashrc setup", "[INFO]".blue());
+            println!("{} Skipping .bashrc update", "[INFO]".blue());
         }
     } else {
         println!("{} No existing .bashrc found, copying from project", "[INFO]".blue());
         fs::copy(&project_bashrc, &home_bashrc)
             .context("Failed to copy .bashrc from project")?;
+        state.bashrc_hash = Some(project_hash);
         println!("{} Successfully installed .bashrc", "[SUCCESS]".green());
     }
 
     Ok(())
 }
 
-fn setup_config_dirs(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, verbose: bool) -> Result<()> {
+fn setup_config_dirs(project_dir: &Path, home_dir: &Path, state: &mut DotfilesState, yes: bool, no: bool, verbose: bool) -> Result<()> {
     let project_config = project_dir.join(".config");
     let home_config = home_dir.join(".config");
 
     if !project_config.exists() {
-        println!("{} No .config directory found in project, skipping", "[WARN]".yellow());
+        if verbose {
+            println!("{} No .config directory found in project, skipping", "[DEBUG]".cyan());
+        }
         return Ok(());
     }
 
@@ -573,15 +639,31 @@ fn setup_config_dirs(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, v
             let dir_name = path.file_name()
                 .context("Invalid directory name")?
                 .to_str()
-                .context("Non-UTF8 directory name")?;
+                .context("Non-UTF8 directory name")?
+                .to_string();
 
-            let target_dir = home_config.join(dir_name);
+            let target_dir = home_config.join(&dir_name);
 
-            println!("{} Processing config directory: {}", "[INFO]".blue(), dir_name);
+            // Generate hash of project config directory
+            let project_hash = generate_directory_hash(&path)?;
 
+            // Check if target dir exists and compare hashes
             if target_dir.exists() {
-                println!("{} Found existing {} config directory", "[INFO]".blue(), dir_name);
-                if ask_user_confirmation(&format!("Do you want to replace your existing {} config with the one from this project?", dir_name), yes, no, verbose)? {
+                let home_hash = generate_directory_hash(&target_dir)?;
+
+                // Compare with stored state
+                if let Some(stored_hash) = state.config_dirs.get(&dir_name) {
+                    if stored_hash == &project_hash && &home_hash == &project_hash {
+                        if verbose {
+                            println!("{} {} config is up to date, skipping", "[DEBUG]".cyan(), dir_name);
+                        }
+                        continue;
+                    }
+                }
+
+                // Configs differ - ask to update
+                println!("{} {} config has changed since last sync", "[INFO]".blue(), dir_name);
+                if ask_user_confirmation(&format!("Do you want to update your {} config with the version from this project?", dir_name), yes, no, verbose)? {
                     // Backup existing config
                     let backup_path = home_config.join(format!("{}.backup", dir_name));
                     if backup_path.exists() {
@@ -594,14 +676,16 @@ fn setup_config_dirs(project_dir: &Path, home_dir: &Path, yes: bool, no: bool, v
                     // Copy project config
                     copy_dir_all(&path, &target_dir)
                         .with_context(|| format!("Failed to copy {} config from project", dir_name))?;
-                    println!("{} Successfully replaced {} config", "[SUCCESS]".green(), dir_name);
+                    state.config_dirs.insert(dir_name.clone(), project_hash);
+                    println!("{} Successfully updated {} config", "[SUCCESS]".green(), dir_name);
                 } else {
-                    println!("{} Skipping {} config setup", "[INFO]".blue(), dir_name);
+                    println!("{} Skipping {} config update", "[INFO]".blue(), dir_name);
                 }
             } else {
                 println!("{} No existing {} config found, copying from project", "[INFO]".blue(), dir_name);
                 copy_dir_all(&path, &target_dir)
                     .with_context(|| format!("Failed to copy {} config from project", dir_name))?;
+                state.config_dirs.insert(dir_name.clone(), project_hash);
                 println!("{} Successfully installed {} config", "[SUCCESS]".green(), dir_name);
             }
         }
@@ -738,6 +822,66 @@ fn save_executed_commands_state(state: &ExecutedCommandsState) -> Result<()> {
     fs::write(&state_file, content)
         .context("Failed to write executed commands state file")?;
     Ok(())
+}
+
+fn get_dotfiles_state_path() -> Result<std::path::PathBuf> {
+    let config_dir = dirs::home_dir()
+        .context("Failed to get home directory")?
+        .join(".config")
+        .join("fedoraforge");
+    fs::create_dir_all(&config_dir)?;
+    Ok(config_dir.join("dotfiles_state.json"))
+}
+
+fn load_dotfiles_state() -> Result<DotfilesState> {
+    let state_file = get_dotfiles_state_path()?;
+
+    if state_file.exists() {
+        let content = fs::read_to_string(&state_file)
+            .context("Failed to read dotfiles state file")?;
+        let state: DotfilesState = serde_json::from_str(&content)
+            .context("Failed to parse dotfiles state file")?;
+        Ok(state)
+    } else {
+        Ok(DotfilesState::default())
+    }
+}
+
+fn save_dotfiles_state(state: &DotfilesState) -> Result<()> {
+    let state_file = get_dotfiles_state_path()?;
+    let content = serde_json::to_string_pretty(state)
+        .context("Failed to serialize dotfiles state")?;
+    fs::write(&state_file, content)
+        .context("Failed to write dotfiles state file")?;
+    Ok(())
+}
+
+fn generate_file_hash(file_path: &Path) -> Result<String> {
+    let content = fs::read(file_path)
+        .with_context(|| format!("Failed to read file {:?}", file_path))?;
+    let mut hasher = Sha256::new();
+    hasher.update(&content);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn generate_directory_hash(dir_path: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+
+    // Walk directory and hash all files in sorted order for consistency
+    let mut files: Vec<_> = Vec::new();
+    for entry in walkdir::WalkDir::new(dir_path).sort_by_file_name() {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+
+    for file in files {
+        let content = fs::read(&file)?;
+        hasher.update(&content);
+    }
+
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn load_package_list(file_path: &str) -> Result<Vec<String>> {
@@ -977,7 +1121,7 @@ fn get_installed_pip_packages() -> Result<Vec<String>> {
     let output = Command::new("pip")
         .args(&["list", "--format=freeze", "--user"])
         .output()
-        .context("Failed to run pip list command")?;
+        .context("pip is not installed or not in PATH")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1103,7 +1247,7 @@ fn get_installed_npm_packages() -> Result<Vec<String>> {
     let output = Command::new("npm")
         .args(&["list", "-g", "--depth=0", "--json"])
         .output()
-        .context("Failed to run npm list command")?;
+        .context("npm is not installed or not in PATH")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1232,7 +1376,7 @@ fn get_installed_cargo_packages() -> Result<Vec<String>> {
     let output = Command::new("cargo")
         .args(&["install", "--list"])
         .output()
-        .context("Failed to run cargo install --list command")?;
+        .context("cargo is not installed or not in PATH")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1560,6 +1704,152 @@ fn install_wireguard_packages_graceful() -> Result<()> {
     Ok(())
 }
 
+fn setup_winapps(enable_winapps: bool, args: &Args) -> Result<()> {
+    if !enable_winapps {
+        if args.verbose {
+            println!("{} WinApps is disabled, skipping setup", "[DEBUG]".cyan());
+        }
+        return Ok(());
+    }
+
+    println!("{} Setting up WinApps...", "[INFO]".blue());
+
+    // Check if winapps-config.toml exists
+    let winapps_config_path = "config/winapps-config.toml";
+    if !std::path::Path::new(winapps_config_path).exists() {
+        anyhow::bail!("WinApps is enabled but config file not found at {}. Please create the config file or set enable_winapps = false", winapps_config_path);
+    }
+
+    // Install WinApps dependencies for Fedora
+    println!("{} Installing WinApps dependencies...", "[INFO]".blue());
+    run_command(
+        &["sudo", "dnf", "install", "-y", "curl", "dialog", "freerdp", "git", "iproute", "libnotify", "nmap-ncat"],
+        "Installing WinApps dependencies"
+    )?;
+
+    // Load WinApps configuration
+    let winapps_config_content = fs::read_to_string(winapps_config_path)
+        .with_context(|| format!("Failed to read WinApps config from {}", winapps_config_path))?;
+
+    let winapps_config: WinAppsConfig = toml::from_str(&winapps_config_content)
+        .with_context(|| format!("Failed to parse WinApps config from {}", winapps_config_path))?;
+
+    // Verify that backend is set to podman
+    if winapps_config.waflavor != "podman" {
+        println!("{} WinApps backend is set to '{}', but only 'podman' is supported. Please set waflavor = \"podman\" in {}",
+                 "[WARNING]".yellow(), winapps_config.waflavor, winapps_config_path);
+        anyhow::bail!("Unsupported WinApps backend: {}. Only 'podman' is supported.", winapps_config.waflavor);
+    }
+
+    // Create WinApps config directory
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+    let winapps_dir = home_dir.join(".config").join("winapps");
+
+    println!("{} Creating WinApps config directory at {:?}", "[INFO]".blue(), winapps_dir);
+    fs::create_dir_all(&winapps_dir)
+        .with_context(|| format!("Failed to create WinApps config directory at {:?}", winapps_dir))?;
+
+    // Write winapps.conf file
+    let winapps_conf_path = winapps_dir.join("winapps.conf");
+    println!("{} Writing WinApps configuration to {:?}", "[INFO]".blue(), winapps_conf_path);
+
+    let mut conf_content = String::new();
+    conf_content.push_str(&format!("RDP_USER=\"{}\"\n", winapps_config.rdp_user));
+    conf_content.push_str(&format!("RDP_PASS=\"{}\"\n", winapps_config.rdp_pass));
+    conf_content.push_str(&format!("RDP_DOMAIN=\"{}\"\n", winapps_config.rdp_domain.as_deref().unwrap_or("")));
+    conf_content.push_str(&format!("RDP_IP=\"{}\"\n", winapps_config.rdp_ip));
+    conf_content.push_str(&format!("VM_NAME=\"{}\"\n", winapps_config.vm_name.as_deref().unwrap_or("RDPWindows")));
+    conf_content.push_str(&format!("WAFLAVOR=\"{}\"\n", winapps_config.waflavor));
+    conf_content.push_str(&format!("RDP_SCALE=\"{}\"\n", winapps_config.rdp_scale.as_deref().unwrap_or("100")));
+    conf_content.push_str(&format!("REMOVABLE_MEDIA=\"{}\"\n", winapps_config.removable_media.as_deref().unwrap_or("/run/media")));
+    conf_content.push_str(&format!("DEBUG=\"{}\"\n", if winapps_config.debug.unwrap_or(false) { "true" } else { "false" }));
+    conf_content.push_str(&format!("MULTIMON=\"{}\"\n", if winapps_config.multimon.unwrap_or(false) { "true" } else { "false" }));
+
+    if let Some(rdp_flags) = &winapps_config.rdp_flags {
+        conf_content.push_str(&format!("RDP_FLAGS=\"{}\"\n", rdp_flags));
+    }
+
+    fs::write(&winapps_conf_path, conf_content)
+        .with_context(|| format!("Failed to write WinApps config to {:?}", winapps_conf_path))?;
+
+    // Set secure permissions on config file (600)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&winapps_conf_path)?.permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&winapps_conf_path, perms)?;
+        println!("{} Set secure permissions (600) on {:?}", "[INFO]".blue(), winapps_conf_path);
+    }
+
+    // Clone WinApps repository
+    let winapps_repo_dir = home_dir.join(".local").join("share").join("winapps");
+
+    if winapps_repo_dir.exists() {
+        println!("{} WinApps repository already exists at {:?}, pulling latest changes...", "[INFO]".blue(), winapps_repo_dir);
+        run_command(
+            &["git", "-C", winapps_repo_dir.to_str().unwrap(), "pull"],
+            "Updating WinApps repository"
+        )?;
+    } else {
+        println!("{} Cloning WinApps repository to {:?}...", "[INFO]".blue(), winapps_repo_dir);
+        fs::create_dir_all(winapps_repo_dir.parent().unwrap())?;
+        run_command(
+            &["git", "clone", "https://github.com/winapps-org/winapps.git", winapps_repo_dir.to_str().unwrap()],
+            "Cloning WinApps repository"
+        )?;
+    }
+
+    // Copy compose.yaml to winapps config directory
+    println!("{} Copying compose.yaml to WinApps config directory...", "[INFO]".blue());
+    let compose_src = winapps_repo_dir.join("compose.yaml");
+    let compose_dest = winapps_dir.join("compose.yaml");
+
+    if compose_src.exists() {
+        fs::copy(&compose_src, &compose_dest)
+            .with_context(|| format!("Failed to copy compose.yaml from {:?} to {:?}", compose_src, compose_dest))?;
+        println!("{} Copied compose.yaml successfully", "[SUCCESS]".green());
+    } else {
+        println!("{} compose.yaml not found in repository, skipping", "[WARNING]".yellow());
+    }
+
+    println!("{} WinApps dependencies and configuration prepared!", "[SUCCESS]".green());
+
+    println!("\n{} ═══════════════════════════════════════════════════════════════", "📋".blue());
+    println!("{} WinApps Setup Instructions", "[INFO]".blue().bold());
+    println!("{} ═══════════════════════════════════════════════════════════════", "📋".blue());
+
+    println!("\n{} STEP 1: Start the Windows Container", "1️⃣".green());
+    println!("     cd {:?}", winapps_dir);
+    println!("     podman-compose --file compose.yaml up -d");
+
+    println!("\n{} IMPORTANT: First-time setup takes 15-30 minutes:", "⏱️".yellow());
+    println!("  • Windows will download (~4-6 GB)");
+    println!("  • Windows will install automatically");
+    println!("  • Container will restart once installation completes");
+
+    println!("\n{} Monitor Progress:", "👀".blue());
+    println!("  • View logs:     podman logs -f WinApps");
+    println!("  • Web console:   http://127.0.0.1:8006");
+    println!("  • Check status:  podman ps | grep WinApps");
+
+    println!("\n{} RAM Configuration (in compose.yaml):", "⚙️".yellow());
+    println!("  • Default: 4GB RAM (may be too high for some systems)");
+    println!("  • If container crashes, edit RAM_SIZE in {:?}", compose_dest);
+    println!("  • Recommended: 2GB minimum, 4GB optimal");
+
+    println!("\n{} STEP 2: Run the WinApps Installer (after Windows boots)", "2️⃣".green());
+    println!("     bash {:?}", winapps_repo_dir.join("setup.sh"));
+    println!("\n  The installer will:");
+    println!("  • Install the winapps binary");
+    println!("  • Let you select which Windows applications to expose");
+    println!("  • Create desktop shortcuts for selected apps");
+
+    println!("\n{} Configuration saved to: {:?}", "✅".green(), winapps_conf_path);
+    println!("{} ═══════════════════════════════════════════════════════════════\n", "📋".blue());
+
+    Ok(())
+}
 
 fn execute_custom_commands(config: &CustomCommandsConfig, verbose: bool) -> Result<()> {
     if config.commands.is_empty() && config.run_once.as_ref().map_or(true, |v| v.is_empty()) {
@@ -1996,8 +2286,9 @@ fn manage_containers_smart(containers: &[Container], home_path: &str, args: &Arg
         actions.push((container, action));
     }
 
-    // Show summary of actions
-    if !actions.is_empty() && !args.yes {
+    // Show summary of actions (only if there are non-Skip actions)
+    let has_actions = actions.iter().any(|(_, action)| !matches!(action, ContainerAction::Skip));
+    if has_actions && !args.yes {
         show_container_action_summary(&actions);
         if !ask_user_confirmation("Proceed with container operations?", args.yes, args.no, args.verbose)? {
             println!("{} Container operations cancelled", "[INFO]".blue());
@@ -2543,7 +2834,27 @@ fn get_current_system_services(verbose: bool) -> Result<HashMap<String, CurrentS
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             let name = parts[0].trim_end_matches(".service");
-            let enabled = parts[1] == "enabled";
+            let state = parts[1];
+
+            // Skip non-manageable service states
+            if matches!(state, "static" | "transient" | "generated" | "indirect" | "alias" | "masked" | "enabled-runtime") {
+                continue;
+            }
+
+            // Skip runtime dbus services and generated autostart services
+            if name.starts_with("dbus-:") || (name.starts_with("app-") && name.contains("@autostart")) {
+                continue;
+            }
+
+            // Skip system services that are auto-managed (keep consistent with user services filtering)
+            if name == "uresourced" {
+                if verbose {
+                    println!("{} Skipping auto-managed system service: {}", "[DEBUG]".cyan(), name);
+                }
+                continue;
+            }
+
+            let enabled = state == "enabled";
             services.insert(name.to_string(), CurrentServiceInfo {
                 enabled,
                 active: false, // Will be updated below
@@ -2593,6 +2904,10 @@ fn get_current_user_services(verbose: bool) -> Result<HashMap<String, CurrentSer
 
     let mut services = HashMap::new();
 
+    // Load container state to exclude Quadlet-managed containers
+    let container_state = load_container_state().unwrap_or_default();
+    let managed_containers: Vec<String> = container_state.containers.keys().cloned().collect();
+
     // Get enabled/disabled state
     let output = run_command_output(&["systemctl", "--user", "list-unit-files", "--type=service", "--no-pager", "--plain"])?;
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -2604,7 +2919,41 @@ fn get_current_user_services(verbose: bool) -> Result<HashMap<String, CurrentSer
         let parts: Vec<&str> = line.split_whitespace().collect();
         if parts.len() >= 2 {
             let name = parts[0].trim_end_matches(".service");
-            let enabled = parts[1] == "enabled";
+            let state = parts[1];
+
+            // Skip non-manageable service states
+            if matches!(state, "static" | "transient" | "generated" | "indirect" | "alias" | "masked" | "enabled-runtime") {
+                continue;
+            }
+
+            // Skip runtime dbus services and generated autostart services
+            if name.starts_with("dbus-:") || (name.starts_with("app-") && name.contains("@autostart")) {
+                continue;
+            }
+
+            // Skip container services managed by Quadlet
+            if managed_containers.contains(&name.to_string()) {
+                if verbose {
+                    println!("{} Skipping Quadlet-managed container service: {}", "[DEBUG]".cyan(), name);
+                }
+                continue;
+            }
+
+            // Skip desktop session services that shouldn't be managed
+            if matches!(name,
+                "pipewire" | "pipewire-pulse" |
+                "dconf" | "uresourced" | "podman-user-wait-network-online" |
+                "at-spi-dbus-bus"
+            ) || name.starts_with("gvfs-")
+              || name.starts_with("evolution-")
+              || (name.starts_with("xdg-") && name != "xdg-user-dirs") {
+                if verbose {
+                    println!("{} Skipping desktop session service: {}", "[DEBUG]".cyan(), name);
+                }
+                continue;
+            }
+
+            let enabled = state == "enabled";
             services.insert(name.to_string(), CurrentServiceInfo {
                 enabled,
                 active: false, // Will be updated below
@@ -3206,7 +3555,7 @@ fn update_services_config_with_discovered(
                 "# System services configuration\n[services]\n{}",
                 new_services.iter()
                     .map(|(name, state)| format!(
-                        r#"{} = {{ enabled = {}, started = {} }}"#,
+                        r#""{}" = {{ enabled = {}, started = {} }}"#,
                         name, state.enabled, state.started
                     ))
                     .collect::<Vec<_>>()
@@ -3216,7 +3565,7 @@ fn update_services_config_with_discovered(
                 "# User services configuration\n[services]\n{}",
                 new_services.iter()
                     .map(|(name, state)| format!(
-                        r#"{} = {{ enabled = {}, started = {} }}"#,
+                        r#""{}" = {{ enabled = {}, started = {} }}"#,
                         name, state.enabled, state.started
                     ))
                     .collect::<Vec<_>>()
@@ -3233,7 +3582,7 @@ fn update_services_config_with_discovered(
 
         for (name, state) in new_services {
             content.push_str(&format!(
-                r#"{} = {{ enabled = {}, started = {} }}"#,
+                r#""{}" = {{ enabled = {}, started = {} }}"#,
                 name, state.enabled, state.started
             ));
             content.push('\n');
