@@ -11,9 +11,10 @@ FedoraForge is a powerful declarative configuration system for Fedora Linux that
 - **Atomic Updates**: Complete system configuration or rollback on failure
 - **Reproducible Builds**: Generate identical systems from the same configuration
 - **Modular Design**: Separate concerns with dedicated files for packages, containers, and system settings
-- **State Tracking**: Intelligent synchronization between declared and actual system state
+- **State Tracking**: Intelligent synchronization between declared and actual system state with hash-based change detection
 - **Drift Detection**: Identify and correct configuration drift from your declared state
 - **Backup Integration**: Automatic backups before any destructive operations
+- **Windows Apps Support**: Run Windows applications seamlessly on Linux via WinApps with Podman
 
 ## 📋 Requirements
 
@@ -89,7 +90,7 @@ vim config/config.toml
 
 Your entire system is defined through configuration files in the `config/` directory:
 
-- `config/config.toml` - System state declaration (hostname, desktop, containers, VPN, drives)
+- `config/config.toml` - System state declaration (hostname, desktop, containers, VPN, drives, WinApps)
 - `config/system-packages.toml` - Declared package state (dnf packages)
 - `config/flatpak-packages.toml` - Declared application state (Flatpak apps)
 - `config/pip-packages.toml` - Declared Python packages (pip)
@@ -97,6 +98,7 @@ Your entire system is defined through configuration files in the `config/` direc
 - `config/cargo-packages.toml` - Declared Rust binaries (cargo install)
 - `config/system-services.toml` - Declared system services state (systemd services as root)
 - `config/user-services.toml` - Declared user services state (systemd user services)
+- `config/winapps-config.toml` - Windows application access via RDP (optional)
 
 ### Bootstrapping Your Configuration
 
@@ -125,7 +127,8 @@ distro = "fedora"
 [system]
 hostname = "my-workstation"      # Desired hostname
 enable_amd_gpu = false           # GPU driver state
-enable_rpm_fusion = true        # Repository state
+enable_rpm_fusion = true         # Repository state
+enable_winapps = false           # Windows apps via RDP
 
 # Declare desktop environment state
 [desktop]
@@ -211,9 +214,15 @@ packages = [
 ### Dotfiles Management
 ```toml
 [dotfiles]
-setup_bashrc = true        # Migrate .bashrc with user confirmation
-setup_config_dirs = true   # Migrate .config subdirectories
+setup_bashrc = true        # Migrate .bashrc with hash-based change detection
+setup_config_dirs = true   # Migrate .config subdirectories with intelligent change tracking
 ```
+
+**Features:**
+- **Hash-based change detection**: Only prompts when files actually change
+- **State tracking**: Remembers file hashes to avoid unnecessary prompts
+- **Automatic backups**: Creates `.backup` files before overwriting
+- **User confirmation**: Prompts only when changes are detected
 
 ### Desktop Environment Configuration
 ```toml
@@ -267,11 +276,12 @@ force_update = false
 #### System Services (config/system-services.toml)
 ```toml
 # System services (run as root)
+# Note: Service names with dots or dashes should be quoted
 [services]
-sshd = { enabled = true, started = true }
-NetworkManager = { enabled = true, started = true }
-firewalld = { enabled = true, started = true }
-cups = { enabled = false, started = false }
+"sshd" = { enabled = true, started = true }
+"NetworkManager" = { enabled = true, started = true }
+"firewalld" = { enabled = true, started = true }
+"cups" = { enabled = false, started = false }
 
 # Custom system services (defined declaratively)
 [[custom_services]]
@@ -309,11 +319,14 @@ WantedBy=timers.target
 #### User Services (config/user-services.toml)
 ```toml
 # User services (run as current user)
+# Note: Service names with dots or dashes MUST be quoted
 [services]
 "podman.socket" = { enabled = true, started = true }
-"pipewire.service" = { enabled = true, started = true }
+"wireplumber" = { enabled = true, started = true }
+"xdg-user-dirs" = { enabled = true, started = false }
 
 # Application autostart (automatically creates systemd user services)
+# Note: Desktop session services (pipewire, gvfs, evolution, etc.) are automatically filtered
 [applications]
 cosmic-term = { enabled = true, restart_policy = "never", delay = 2 }
 firefox = { enabled = true, restart_policy = "never", delay = 5 }
@@ -359,6 +372,70 @@ The tool will automatically:
 - Enable autoconnect for the VPN connection
 - Handle Fedora version compatibility issues gracefully
 
+### WinApps Configuration (Windows Applications on Linux)
+
+Run Windows applications seamlessly on Linux via RDP with Podman backend:
+
+```toml
+# config/config.toml
+[system]
+enable_winapps = true  # Enable WinApps integration
+```
+
+```toml
+# config/winapps-config.toml
+rdp_user = "MyWindowsUser"
+rdp_pass = "MyWindowsPassword"
+rdp_domain = ""
+rdp_ip = "127.0.0.1"
+vm_name = "RDPWindows"
+waflavor = "podman"  # Must be podman
+rdp_scale = "100"
+removable_media = "/run/media"
+debug = false
+multimon = false
+rdp_flags = "/sound /microphone +home-drive /cert:tofu"
+```
+
+**Setup Process**:
+1. Set `enable_winapps = true` in `config/config.toml`
+2. Create `config/winapps-config.toml` with your Windows RDP credentials
+3. Run FedoraForge to install dependencies and prepare configuration
+4. Start the Windows container:
+   ```bash
+   cd ~/.config/winapps
+   podman-compose --file compose.yaml up -d
+   ```
+5. Wait 15-30 minutes for Windows to install (first time only)
+6. Monitor progress:
+   ```bash
+   # View logs
+   podman logs -f RDPWindows
+
+   # Or access web console
+   http://localhost:8006
+   ```
+7. Once Windows is ready, run the installer:
+   ```bash
+   cd ~/.config/winapps
+   ./installer.sh
+   ```
+
+**What You Get**:
+- Windows applications accessible from your Linux desktop
+- Seamless integration with native Linux applications
+- RDP-based connection to a Podman container running Windows
+- Support for audio, file sharing, and multiple monitors
+
+**Dependencies Installed**:
+- curl, dialog, freerdp, git, iproute, libnotify, nmap-ncat
+
+**Notes**:
+- First-time setup takes 15-30 minutes for Windows to install
+- RAM allocation is configurable in `~/.config/winapps/compose.yaml` (default: 2GB)
+- Requires Podman backend (Docker is not supported)
+- Configuration stored securely in `~/.config/winapps/winapps.conf` (mode 600)
+
 ### Command State Declaration
 ```toml
 [custom_commands]
@@ -387,6 +464,7 @@ run_once = [
 - ✅ System and user services management from `config/system-services.toml` and `config/user-services.toml`
 - ✅ Custom service definition and deployment (systemd services defined declaratively)
 - ✅ Application autostart management (automatically creates systemd user services for applications)
+- ✅ WinApps integration for Windows application access via RDP with Podman
 
 ### Desktop Environment
 - ✅ Desktop environment package installation (COSMIC, GNOME, KDE, etc.)
@@ -402,10 +480,11 @@ run_once = [
 - ✅ Volume and network setup
 
 ### Dotfiles
-- ✅ `.bashrc` migration with backup
-- ✅ `.config` directory synchronization
-- ✅ User confirmation prompts
+- ✅ `.bashrc` migration with backup and hash-based change detection
+- ✅ `.config` directory synchronization with intelligent change tracking
+- ✅ User confirmation prompts (only when files actually change)
 - ✅ Preserves existing configurations
+- ✅ State tracking prevents unnecessary prompts
 
 ## 🔧 Usage Examples
 
@@ -441,9 +520,10 @@ Once containers are running:
 ## 🛡️ Safety Features
 
 - **Backup Creation**: Automatically backs up existing configurations
-- **User Confirmation**: Prompts before overwriting files
+- **User Confirmation**: Prompts before overwriting files (only when changes are detected)
 - **Distribution Detection**: Warns if config doesn't match detected OS
-- **Hash-based Command Tracking**: Run-once commands tracked via SHA-256 hash to prevent duplicate execution
+- **Hash-based Change Detection**: Files and commands tracked via SHA-256 hash to prevent duplicate execution and unnecessary prompts
+- **Intelligent Service Filtering**: Automatically filters out desktop session and transient services
 - **Error Handling**: Comprehensive error reporting and rollback
 
 ## 🔍 Troubleshooting
@@ -472,6 +552,26 @@ podman logs <container-name>
 ./fedoraforge --config config.toml --help
 ```
 
+**WinApps Issues**
+```bash
+# Check Windows container status
+podman ps -a | grep RDPWindows
+
+# View Windows installation logs
+podman logs -f RDPWindows
+
+# Check RAM allocation (if container crashes)
+cat ~/.config/winapps/compose.yaml | grep RAM_SIZE
+
+# Restart Windows container
+cd ~/.config/winapps
+podman-compose down
+podman-compose up -d
+
+# Access web console for troubleshooting
+# Open browser to: http://localhost:8006
+```
+
 ## 📝 Configuration Templates
 
 ### Minimal Setup (config/config.toml)
@@ -481,6 +581,7 @@ distro = "fedora"
 hostname = "minimal-setup"
 enable_amd_gpu = false
 enable_rpm_fusion = false
+enable_winapps = false
 [dotfiles]
 setup_bashrc = true
 setup_config_dirs = false
@@ -503,6 +604,7 @@ distro = "fedora"
 hostname = "workstation"
 enable_amd_gpu = false
 enable_rpm_fusion = true
+enable_winapps = false  # Set to true if you need Windows apps
 
 [desktop]
 environment = "cosmic-desktop"
@@ -544,16 +646,18 @@ packages = [
 **Full System Services (config/system-services.toml):**
 ```toml
 [services]
-sshd = { enabled = true, started = true }
-NetworkManager = { enabled = true, started = true }
-firewalld = { enabled = true, started = true }
+"sshd" = { enabled = true, started = true }
+"NetworkManager" = { enabled = true, started = true }
+"firewalld" = { enabled = true, started = true }
 ```
 
 **Full User Services (config/user-services.toml):**
 ```toml
 [services]
 "podman.socket" = { enabled = true, started = true }
-"pipewire.service" = { enabled = true, started = true }
+"wireplumber" = { enabled = true, started = true }
+"dbus-broker" = { enabled = true, started = true }
+"xdg-user-dirs" = { enabled = true, started = false }
 
 [applications]
 cosmic-term = { enabled = true, restart_policy = "never", delay = 2 }
