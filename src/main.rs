@@ -64,6 +64,7 @@ struct Config {
     vpn: Option<VpnConfig>,
     dotfiles: Option<DotfilesConfig>,
     custom_commands: Option<CustomCommandsConfig>,
+    users_groups: Option<UsersGroupsConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -266,6 +267,73 @@ enum ServiceScope {
     User,
 }
 
+// Users and Groups configuration structures
+#[derive(Deserialize, Serialize, Debug)]
+struct UsersGroupsConfig {
+    users: Option<HashMap<String, UserConfig>>,
+    groups: Option<HashMap<String, GroupConfig>>,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct UserConfig {
+    uid: Option<u32>,              // User ID (auto-assign if None)
+    gid: Option<u32>,              // Primary group ID
+    groups: Option<Vec<String>>,   // Supplementary groups
+    home: Option<String>,          // Home directory
+    shell: Option<String>,         // Login shell
+    comment: Option<String>,       // GECOS field (full name, etc.)
+    create_home: Option<bool>,     // Create home directory (default: true)
+    system: Option<bool>,          // Is system user (default: false)
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+struct GroupConfig {
+    gid: Option<u32>,              // Group ID (auto-assign if None)
+    members: Option<Vec<String>>,  // Group members
+    system: Option<bool>,          // Is system group (default: false)
+}
+
+#[derive(Debug, Clone)]
+struct CurrentUserInfo {
+    uid: u32,
+    gid: u32,
+    groups: Vec<String>,
+    home: String,
+    shell: String,
+    comment: String,
+}
+
+#[derive(Debug, Clone)]
+struct CurrentGroupInfo {
+    gid: u32,
+    members: Vec<String>,
+}
+
+// State tracking for managed users and groups
+#[derive(Serialize, Deserialize, Debug, Default)]
+struct UsersGroupsState {
+    managed_users: HashMap<String, ManagedUserInfo>,
+    managed_groups: HashMap<String, ManagedGroupInfo>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ManagedUserInfo {
+    uid: u32,
+    managed_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct ManagedGroupInfo {
+    gid: u32,
+    managed_at: u64,
+}
+
+// Constants for user/group filtering
+const MIN_USER_UID: u32 = 1000;
+const MIN_GROUP_GID: u32 = 1000;
+const MAX_USER_UID: u32 = 60000;
+const MAX_GROUP_GID: u32 = 60000;
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -325,7 +393,10 @@ fn main() -> Result<()> {
         // Generate services config
         generate_initial_services_configs()?;
 
-        println!("{} Package and services configuration files generated successfully!", "[SUCCESS]".green());
+        // Generate users and groups config
+        generate_initial_users_groups_config()?;
+
+        println!("{} Package, services, and users/groups configuration files generated successfully!", "[SUCCESS]".green());
         println!("Now create your main config/config.toml file and run again without --initial");
         return Ok(());
     }
@@ -414,6 +485,9 @@ fn main() -> Result<()> {
 
     // Synchronize services with system state
     sync_services(args.yes, args.no, args.verbose)?;
+
+    // Synchronize users and groups with system state
+    sync_users_and_groups(args.yes, args.no, args.verbose)?;
 
     // Podman setup
     if let Some(podman) = &config.podman {
@@ -3657,6 +3731,1037 @@ fn generate_initial_services_configs() -> Result<()> {
         update_services_config_with_discovered(&user_enabled, "config/user-services.toml", ServiceScope::User)?;
         println!("{} Generated config/user-services.toml with {} services", "[SUCCESS]".green(), user_enabled.len());
     }
+
+    Ok(())
+}
+
+// ============================================================================
+// Users and Groups Management Functions
+// ============================================================================
+
+// Validation functions
+fn validate_username(username: &str) -> Result<()> {
+    // Username regex: must start with lowercase letter or underscore
+    // Can contain lowercase letters, numbers, underscores, and hyphens
+    // May end with a dollar sign (for machine accounts)
+    use regex::Regex;
+    let re = Regex::new(r"^[a-z_][a-z0-9_-]*[$]?$").context("Failed to compile username regex")?;
+
+    if !re.is_match(username) {
+        anyhow::bail!("Invalid username '{}': must start with a lowercase letter or underscore, and contain only lowercase letters, numbers, underscores, hyphens, and optionally end with $", username);
+    }
+
+    if username.len() > 32 {
+        anyhow::bail!("Username '{}' is too long (max 32 characters)", username);
+    }
+
+    Ok(())
+}
+
+fn validate_groupname(groupname: &str) -> Result<()> {
+    // Same rules as username
+    validate_username(groupname).context(format!("Invalid groupname '{}'", groupname))
+}
+
+fn validate_uid(uid: u32) -> Result<()> {
+    if uid < MIN_USER_UID {
+        anyhow::bail!("UID {} is below minimum {} (system UID range)", uid, MIN_USER_UID);
+    }
+    if uid > MAX_USER_UID {
+        anyhow::bail!("UID {} exceeds maximum {}", uid, MAX_USER_UID);
+    }
+    Ok(())
+}
+
+fn validate_gid(gid: u32) -> Result<()> {
+    if gid < MIN_GROUP_GID {
+        anyhow::bail!("GID {} is below minimum {} (system GID range)", gid, MIN_GROUP_GID);
+    }
+    if gid > MAX_GROUP_GID {
+        anyhow::bail!("GID {} exceeds maximum {}", gid, MAX_GROUP_GID);
+    }
+    Ok(())
+}
+
+fn validate_shell(shell: &str) -> Result<()> {
+    // Check if shell exists in /etc/shells
+    let shells_content = fs::read_to_string("/etc/shells")
+        .context("Failed to read /etc/shells")?;
+
+    let valid_shells: Vec<&str> = shells_content
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+        .map(|line| line.trim())
+        .collect();
+
+    if !valid_shells.contains(&shell) {
+        anyhow::bail!("Shell '{}' is not listed in /etc/shells. Valid shells: {:?}", shell, valid_shells);
+    }
+
+    Ok(())
+}
+
+// Backup function
+fn backup_user_files(verbose: bool) -> Result<()> {
+    if verbose {
+        println!("{} Backing up user/group files", "[DEBUG]".cyan());
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    let backup_dir = "/etc";
+    let files_to_backup = vec![
+        ("passwd", format!("{}/passwd.fedoraforge.{}.backup", backup_dir, timestamp)),
+        ("group", format!("{}/group.fedoraforge.{}.backup", backup_dir, timestamp)),
+        ("shadow", format!("{}/shadow.fedoraforge.{}.backup", backup_dir, timestamp)),
+    ];
+
+    for (file, backup) in files_to_backup {
+        let source = format!("{}/{}", backup_dir, file);
+        if Path::new(&source).exists() {
+            run_command(&["sudo", "cp", "-p", &source, &backup],
+                &format!("Backing up {}", file))?;
+            if verbose {
+                println!("{} Backed up {} to {}", "[DEBUG]".cyan(), source, backup);
+            }
+        }
+    }
+
+    println!("{} User/group files backed up successfully", "[SUCCESS]".green());
+    Ok(())
+}
+
+// Discovery functions
+fn get_current_users(verbose: bool) -> Result<HashMap<String, CurrentUserInfo>> {
+    if verbose {
+        println!("{} Discovering users (UID >= {})", "[DEBUG]".cyan(), MIN_USER_UID);
+    }
+
+    let passwd_content = fs::read_to_string("/etc/passwd")
+        .context("Failed to read /etc/passwd")?;
+
+    let mut users = HashMap::new();
+
+    for line in passwd_content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 7 {
+            continue;
+        }
+
+        let username = parts[0];
+        let uid: u32 = parts[2].parse().unwrap_or(0);
+        let gid: u32 = parts[3].parse().unwrap_or(0);
+        let comment = parts[4];
+        let home = parts[5];
+        let shell = parts[6];
+
+        // Filter system users (UID < 1000) and special accounts
+        if uid < MIN_USER_UID {
+            continue;
+        }
+
+        if uid > MAX_USER_UID {
+            continue;
+        }
+
+        // Get supplementary groups using id command
+        let groups = get_user_supplementary_groups(username)?;
+
+        users.insert(username.to_string(), CurrentUserInfo {
+            uid,
+            gid,
+            groups,
+            home: home.to_string(),
+            shell: shell.to_string(),
+            comment: comment.to_string(),
+        });
+    }
+
+    if verbose {
+        println!("{} Discovered {} non-system users", "[DEBUG]".cyan(), users.len());
+    }
+
+    Ok(users)
+}
+
+fn get_user_supplementary_groups(username: &str) -> Result<Vec<String>> {
+    let output = Command::new("id")
+        .args(&["-nG", username])
+        .output()
+        .context(format!("Failed to get groups for user {}", username))?;
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    let groups_str = String::from_utf8(output.stdout)?;
+    let groups: Vec<String> = groups_str
+        .split_whitespace()
+        .skip(1) // Skip primary group (first in list)
+        .map(|s| s.to_string())
+        .collect();
+
+    Ok(groups)
+}
+
+fn get_current_groups(verbose: bool) -> Result<HashMap<String, CurrentGroupInfo>> {
+    if verbose {
+        println!("{} Discovering groups (GID >= {})", "[DEBUG]".cyan(), MIN_GROUP_GID);
+    }
+
+    let group_content = fs::read_to_string("/etc/group")
+        .context("Failed to read /etc/group")?;
+
+    let mut groups = HashMap::new();
+
+    for line in group_content.lines() {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() < 4 {
+            continue;
+        }
+
+        let groupname = parts[0];
+        let gid: u32 = parts[2].parse().unwrap_or(0);
+        let members_str = parts[3];
+
+        // Filter system groups (GID < 1000)
+        if gid < MIN_GROUP_GID {
+            continue;
+        }
+
+        if gid > MAX_GROUP_GID {
+            continue;
+        }
+
+        let members: Vec<String> = if members_str.is_empty() {
+            Vec::new()
+        } else {
+            members_str.split(',').map(|s| s.to_string()).collect()
+        };
+
+        groups.insert(groupname.to_string(), CurrentGroupInfo {
+            gid,
+            members,
+        });
+    }
+
+    if verbose {
+        println!("{} Discovered {} non-system groups", "[DEBUG]".cyan(), groups.len());
+    }
+
+    Ok(groups)
+}
+
+// Config management functions
+fn load_users_groups_config() -> Result<UsersGroupsConfig> {
+    let config_path = "config/users-groups.toml";
+
+    if !Path::new(config_path).exists() {
+        return Ok(UsersGroupsConfig {
+            users: None,
+            groups: None,
+        });
+    }
+
+    let content = fs::read_to_string(config_path)
+        .context(format!("Failed to read {}", config_path))?;
+
+    let config: UsersGroupsConfig = toml::from_str(&content)
+        .context("Failed to parse users-groups TOML file")?;
+
+    Ok(config)
+}
+
+// State management functions
+fn load_users_groups_state() -> Result<UsersGroupsState> {
+    let state_dir = dirs::home_dir()
+        .context("Could not find home directory")?
+        .join(".config/fedoraforge");
+
+    let state_file = state_dir.join("users_groups_state.json");
+
+    if !state_file.exists() {
+        return Ok(UsersGroupsState::default());
+    }
+
+    let content = fs::read_to_string(&state_file)
+        .context("Failed to read users/groups state file")?;
+
+    let state: UsersGroupsState = serde_json::from_str(&content)
+        .context("Failed to parse users/groups state JSON")?;
+
+    Ok(state)
+}
+
+fn save_users_groups_state(state: &UsersGroupsState) -> Result<()> {
+    let state_dir = dirs::home_dir()
+        .context("Could not find home directory")?
+        .join(".config/fedoraforge");
+
+    fs::create_dir_all(&state_dir)
+        .context("Failed to create state directory")?;
+
+    let state_file = state_dir.join("users_groups_state.json");
+
+    let json = serde_json::to_string_pretty(state)
+        .context("Failed to serialize users/groups state")?;
+
+    fs::write(&state_file, json)
+        .context("Failed to write users/groups state file")?;
+
+    Ok(())
+}
+
+fn update_users_groups_config_with_discovered(
+    discovered_users: &HashMap<String, CurrentUserInfo>,
+    discovered_groups: &HashMap<String, CurrentGroupInfo>,
+    config_path: &str,
+) -> Result<()> {
+    // Build TOML content manually for better formatting
+    let mut toml_content = String::from("# Users and Groups Configuration\n\n");
+
+    // Add users section
+    if !discovered_users.is_empty() {
+        toml_content.push_str("[users]\n");
+        for (username, info) in discovered_users {
+            toml_content.push_str(&format!("[users.\"{}\"]\n", username));
+            toml_content.push_str(&format!("uid = {}\n", info.uid));
+            toml_content.push_str(&format!("gid = {}\n", info.gid));
+
+            if !info.groups.is_empty() {
+                toml_content.push_str("groups = [");
+                toml_content.push_str(&info.groups.iter()
+                    .map(|g| format!("\"{}\"", g))
+                    .collect::<Vec<_>>()
+                    .join(", "));
+                toml_content.push_str("]\n");
+            }
+
+            toml_content.push_str(&format!("home = \"{}\"\n", info.home));
+            toml_content.push_str(&format!("shell = \"{}\"\n", info.shell));
+
+            if !info.comment.is_empty() {
+                toml_content.push_str(&format!("comment = \"{}\"\n", info.comment));
+            }
+
+            toml_content.push_str("create_home = true\n");
+            toml_content.push_str("system = false\n\n");
+        }
+    }
+
+    // Add groups section
+    if !discovered_groups.is_empty() {
+        toml_content.push_str("[groups]\n");
+        for (groupname, info) in discovered_groups {
+            toml_content.push_str(&format!("[groups.\"{}\"]\n", groupname));
+            toml_content.push_str(&format!("gid = {}\n", info.gid));
+
+            if !info.members.is_empty() {
+                toml_content.push_str("members = [");
+                toml_content.push_str(&info.members.iter()
+                    .map(|m| format!("\"{}\"", m))
+                    .collect::<Vec<_>>()
+                    .join(", "));
+                toml_content.push_str("]\n");
+            }
+
+            toml_content.push_str("system = false\n\n");
+        }
+    }
+
+    fs::write(config_path, toml_content)
+        .context(format!("Failed to write {}", config_path))?;
+
+    Ok(())
+}
+
+// Group management functions
+fn create_group(groupname: &str, config: &GroupConfig, verbose: bool) -> Result<()> {
+    validate_groupname(groupname)?;
+
+    if let Some(gid) = config.gid {
+        validate_gid(gid)?;
+    }
+
+    let mut cmd_args = vec!["sudo", "groupadd"];
+    let gid_str;
+
+    if let Some(gid) = config.gid {
+        cmd_args.push("-g");
+        gid_str = gid.to_string();
+        cmd_args.push(&gid_str);
+    }
+
+    if config.system.unwrap_or(false) {
+        cmd_args.push("--system");
+    }
+
+    cmd_args.push(groupname);
+
+    run_command(&cmd_args, &format!("Creating group {}", groupname))?;
+
+    // Add members if specified
+    if let Some(members) = &config.members {
+        for member in members {
+            let result = run_command(
+                &["sudo", "gpasswd", "-a", member, groupname],
+                &format!("Adding {} to group {}", member, groupname)
+            );
+            if result.is_err() && verbose {
+                println!("{} Failed to add user {} to group {}: user may not exist yet",
+                    "[WARN]".yellow(), member, groupname);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn modify_group(groupname: &str, current: &CurrentGroupInfo, desired: &GroupConfig, verbose: bool) -> Result<()> {
+    // Check if GID needs to change
+    if let Some(desired_gid) = desired.gid {
+        if desired_gid != current.gid {
+            validate_gid(desired_gid)?;
+            run_command(
+                &["sudo", "groupmod", "-g", &desired_gid.to_string(), groupname],
+                &format!("Changing GID for group {}", groupname)
+            )?;
+        }
+    }
+
+    // Handle member changes
+    if let Some(desired_members) = &desired.members {
+        let current_members: std::collections::HashSet<_> = current.members.iter().collect();
+        let desired_members_set: std::collections::HashSet<_> = desired_members.iter().collect();
+
+        // Add missing members
+        for member in desired_members_set.difference(&current_members) {
+            let result = run_command(
+                &["sudo", "gpasswd", "-a", member, groupname],
+                &format!("Adding {} to group {}", member, groupname)
+            );
+            if result.is_err() && verbose {
+                println!("{} Failed to add user {} to group {}: user may not exist",
+                    "[WARN]".yellow(), member, groupname);
+            }
+        }
+
+        // Remove extra members
+        for member in current_members.difference(&desired_members_set) {
+            run_command(
+                &["sudo", "gpasswd", "-d", member, groupname],
+                &format!("Removing {} from group {}", member, groupname)
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn delete_group(groupname: &str) -> Result<()> {
+    validate_groupname(groupname)?;
+    run_command(
+        &["sudo", "groupdel", groupname],
+        &format!("Deleting group {}", groupname)
+    )?;
+    Ok(())
+}
+
+// User management functions
+fn create_user(username: &str, config: &UserConfig, verbose: bool) -> Result<()> {
+    validate_username(username)?;
+
+    if let Some(uid) = config.uid {
+        validate_uid(uid)?;
+    }
+
+    let mut cmd_args = vec!["sudo", "useradd"];
+    let uid_str;
+    let gid_str;
+
+    if let Some(uid) = config.uid {
+        cmd_args.push("-u");
+        uid_str = uid.to_string();
+        cmd_args.push(&uid_str);
+    }
+
+    if let Some(gid) = config.gid {
+        validate_gid(gid)?;
+        cmd_args.push("-g");
+        gid_str = gid.to_string();
+        cmd_args.push(&gid_str);
+    }
+
+    if let Some(home) = &config.home {
+        cmd_args.push("-d");
+        cmd_args.push(home);
+    }
+
+    if let Some(shell) = &config.shell {
+        validate_shell(shell)?;
+        cmd_args.push("-s");
+        cmd_args.push(shell);
+    }
+
+    if let Some(comment) = &config.comment {
+        cmd_args.push("-c");
+        cmd_args.push(comment);
+    }
+
+    // Create home directory by default unless explicitly disabled
+    if config.create_home.unwrap_or(true) {
+        cmd_args.push("-m");
+    } else {
+        cmd_args.push("-M");
+    }
+
+    if config.system.unwrap_or(false) {
+        cmd_args.push("--system");
+    }
+
+    cmd_args.push(username);
+
+    run_command(&cmd_args, &format!("Creating user {}", username))?;
+
+    // Add to supplementary groups
+    if let Some(groups) = &config.groups {
+        if !groups.is_empty() {
+            let groups_str = groups.join(",");
+            let result = run_command(
+                &["sudo", "usermod", "-aG", &groups_str, username],
+                &format!("Adding {} to groups: {}", username, groups_str)
+            );
+            if result.is_err() && verbose {
+                println!("{} Failed to add user to some groups: groups may not exist yet",
+                    "[WARN]".yellow());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn modify_user(username: &str, current: &CurrentUserInfo, desired: &UserConfig, verbose: bool) -> Result<()> {
+    // Check UID change
+    if let Some(desired_uid) = desired.uid {
+        if desired_uid != current.uid {
+            validate_uid(desired_uid)?;
+            run_command(
+                &["sudo", "usermod", "-u", &desired_uid.to_string(), username],
+                &format!("Changing UID for user {}", username)
+            )?;
+        }
+    }
+
+    // Check GID change
+    if let Some(desired_gid) = desired.gid {
+        if desired_gid != current.gid {
+            validate_gid(desired_gid)?;
+            run_command(
+                &["sudo", "usermod", "-g", &desired_gid.to_string(), username],
+                &format!("Changing primary GID for user {}", username)
+            )?;
+        }
+    }
+
+    // Check home directory change
+    if let Some(desired_home) = &desired.home {
+        if desired_home != &current.home {
+            run_command(
+                &["sudo", "usermod", "-d", desired_home, username],
+                &format!("Changing home directory for user {}", username)
+            )?;
+        }
+    }
+
+    // Check shell change
+    if let Some(desired_shell) = &desired.shell {
+        if desired_shell != &current.shell {
+            validate_shell(desired_shell)?;
+            run_command(
+                &["sudo", "usermod", "-s", desired_shell, username],
+                &format!("Changing shell for user {}", username)
+            )?;
+        }
+    }
+
+    // Check comment change
+    if let Some(desired_comment) = &desired.comment {
+        if desired_comment != &current.comment {
+            run_command(
+                &["sudo", "usermod", "-c", desired_comment, username],
+                &format!("Changing comment for user {}", username)
+            )?;
+        }
+    }
+
+    // Handle supplementary groups
+    if let Some(desired_groups) = &desired.groups {
+        let current_groups_set: std::collections::HashSet<_> = current.groups.iter().collect();
+        let desired_groups_set: std::collections::HashSet<_> = desired_groups.iter().collect();
+
+        if current_groups_set != desired_groups_set {
+            // Set groups using -G flag (replaces all supplementary groups)
+            let groups_str = desired_groups.join(",");
+            let result = run_command(
+                &["sudo", "usermod", "-G", &groups_str, username],
+                &format!("Updating groups for user {}", username)
+            );
+            if result.is_err() && verbose {
+                println!("{} Failed to update groups: some groups may not exist",
+                    "[WARN]".yellow());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn delete_user(username: &str, remove_home: bool, verbose: bool) -> Result<()> {
+    validate_username(username)?;
+
+    let mut cmd_args = vec!["sudo", "userdel"];
+
+    if remove_home {
+        cmd_args.push("-r");
+        if verbose {
+            println!("{} Will remove home directory for user {}", "[INFO]".yellow(), username);
+        }
+    }
+
+    cmd_args.push(username);
+
+    run_command(&cmd_args, &format!("Deleting user {}", username))?;
+    Ok(())
+}
+
+// Bidirectional sync functions
+fn sync_groups_bidirectional(
+    declared: &HashMap<String, GroupConfig>,
+    current: &HashMap<String, CurrentGroupInfo>,
+    state: &mut UsersGroupsState,
+    yes: bool,
+    no: bool,
+    verbose: bool,
+) -> Result<()> {
+    if verbose {
+        println!("{} Syncing groups bidirectionally", "[DEBUG]".cyan());
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    // Find groups in system but not in config (add to config or delete)
+    let undeclared_groups: HashMap<String, CurrentGroupInfo> = current.iter()
+        .filter(|(name, _)| !declared.contains_key(*name) && !state.managed_groups.contains_key(*name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    if !undeclared_groups.is_empty() {
+        println!("{} Found {} groups not in config:", "[INFO]".blue(), undeclared_groups.len());
+        for (name, info) in &undeclared_groups {
+            println!("  - {} (GID: {}, members: {})", name, info.gid,
+                if info.members.is_empty() { "none".to_string() } else { info.members.join(", ") });
+        }
+
+        println!("What would you like to do with these groups?");
+        println!("  1. Add to config (manage them)");
+        println!("  2. Delete from system");
+        println!("  3. Ignore (leave as-is)");
+
+        if yes {
+            // Auto-yes means add to config
+            update_users_groups_config_with_discovered(&HashMap::new(), &undeclared_groups, "config/users-groups.toml")?;
+            println!("{} Added {} groups to config/users-groups.toml", "[SUCCESS]".green(), undeclared_groups.len());
+        } else if !no {
+            print!("Enter choice [1-3]: ");
+            io::stdout().flush()?;
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice)?;
+
+            match choice.trim() {
+                "1" => {
+                    update_users_groups_config_with_discovered(&HashMap::new(), &undeclared_groups, "config/users-groups.toml")?;
+                    println!("{} Added {} groups to config/users-groups.toml", "[SUCCESS]".green(), undeclared_groups.len());
+                }
+                "2" => {
+                    if ask_user_confirmation("Are you sure you want to delete these groups?", false, false, verbose)? {
+                        for (name, _) in &undeclared_groups {
+                            delete_group(name)?;
+                            println!("{} Deleted group {}", "[SUCCESS]".green(), name);
+                        }
+                    }
+                }
+                "3" | "" => {
+                    println!("{} Ignoring undeclared groups", "[INFO]".blue());
+                }
+                _ => {
+                    println!("{} Invalid choice, ignoring", "[WARN]".yellow());
+                }
+            }
+        }
+    }
+
+    // Find groups in config but not in system (create them)
+    let groups_to_create: Vec<_> = declared.iter()
+        .filter(|(name, _)| !current.contains_key(*name))
+        .collect();
+
+    if !groups_to_create.is_empty() {
+        println!("{} Found {} groups in config that don't exist:", "[INFO]".blue(), groups_to_create.len());
+        for (name, _) in &groups_to_create {
+            println!("  - {}", name);
+        }
+
+        if ask_user_confirmation("Create these groups?", yes, no, verbose)? {
+            for (name, config) in groups_to_create {
+                create_group(name, config, verbose)?;
+                // Get the created group's GID
+                let created_info = get_current_groups(false)?;
+                if let Some(info) = created_info.get(name) {
+                    state.managed_groups.insert(name.clone(), ManagedGroupInfo {
+                        gid: info.gid,
+                        managed_at: timestamp,
+                    });
+                }
+                println!("{} Created group {}", "[SUCCESS]".green(), name);
+            }
+        }
+    }
+
+    // Find groups with different states (update them)
+    let groups_to_modify: Vec<_> = declared.iter()
+        .filter_map(|(name, desired)| {
+            current.get(name).and_then(|current_info| {
+                // Check if GID differs
+                let gid_differs = desired.gid.map_or(false, |gid| gid != current_info.gid);
+
+                // Check if members differ
+                let desired_members = desired.members.as_ref().map(|m| m.iter().collect::<std::collections::HashSet<_>>());
+                let current_members = current_info.members.iter().collect::<std::collections::HashSet<_>>();
+                let members_differ = desired_members.map_or(false, |dm| dm != current_members);
+
+                if gid_differs || members_differ {
+                    Some((name, desired, current_info))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    if !groups_to_modify.is_empty() {
+        println!("{} Found {} groups with different states:", "[INFO]".blue(), groups_to_modify.len());
+        for (name, desired, current) in &groups_to_modify {
+            println!("  - {}: current(GID={}, members=[{}]) -> desired(GID={}, members=[{}])",
+                name,
+                current.gid,
+                current.members.join(", "),
+                desired.gid.map_or_else(|| current.gid.to_string(), |g| g.to_string()),
+                desired.members.as_ref().map_or_else(|| "".to_string(), |m| m.join(", "))
+            );
+        }
+
+        if ask_user_confirmation("Apply these group changes?", yes, no, verbose)? {
+            for (name, desired, current) in groups_to_modify {
+                modify_group(name, current, desired, verbose)?;
+                // Update state with new GID if changed
+                let new_gid = desired.gid.unwrap_or(current.gid);
+                state.managed_groups.insert(name.clone(), ManagedGroupInfo {
+                    gid: new_gid,
+                    managed_at: timestamp,
+                });
+                println!("{} Modified group {}", "[SUCCESS]".green(), name);
+            }
+        }
+    }
+
+    // Update state for all declared groups
+    for (name, _config) in declared {
+        if let Some(info) = current.get(name) {
+            state.managed_groups.entry(name.clone()).or_insert(ManagedGroupInfo {
+                gid: info.gid,
+                managed_at: timestamp,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn sync_users_bidirectional(
+    declared: &HashMap<String, UserConfig>,
+    current: &HashMap<String, CurrentUserInfo>,
+    state: &mut UsersGroupsState,
+    yes: bool,
+    no: bool,
+    verbose: bool,
+) -> Result<()> {
+    if verbose {
+        println!("{} Syncing users bidirectionally", "[DEBUG]".cyan());
+    }
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+
+    // Find users in system but not in config (add to config or delete)
+    let undeclared_users: HashMap<String, CurrentUserInfo> = current.iter()
+        .filter(|(name, _)| !declared.contains_key(*name) && !state.managed_users.contains_key(*name))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+
+    if !undeclared_users.is_empty() {
+        println!("{} Found {} users not in config:", "[INFO]".blue(), undeclared_users.len());
+        for (name, info) in &undeclared_users {
+            println!("  - {} (UID: {}, shell: {}, home: {})", name, info.uid, info.shell, info.home);
+        }
+
+        println!("What would you like to do with these users?");
+        println!("  1. Add to config (manage them)");
+        println!("  2. Delete from system");
+        println!("  3. Ignore (leave as-is)");
+
+        if yes {
+            // Auto-yes means add to config
+            update_users_groups_config_with_discovered(&undeclared_users, &HashMap::new(), "config/users-groups.toml")?;
+            println!("{} Added {} users to config/users-groups.toml", "[SUCCESS]".green(), undeclared_users.len());
+        } else if !no {
+            print!("Enter choice [1-3]: ");
+            io::stdout().flush()?;
+            let mut choice = String::new();
+            io::stdin().read_line(&mut choice)?;
+
+            match choice.trim() {
+                "1" => {
+                    update_users_groups_config_with_discovered(&undeclared_users, &HashMap::new(), "config/users-groups.toml")?;
+                    println!("{} Added {} users to config/users-groups.toml", "[SUCCESS]".green(), undeclared_users.len());
+                }
+                "2" => {
+                    if ask_user_confirmation("Are you sure you want to delete these users?", false, false, verbose)? {
+                        for (name, _) in &undeclared_users {
+                            let remove_home = ask_user_confirmation(
+                                &format!("Remove home directory for user '{}'?", name),
+                                false, false, verbose
+                            )?;
+                            delete_user(name, remove_home, verbose)?;
+                            println!("{} Deleted user {}", "[SUCCESS]".green(), name);
+                        }
+                    }
+                }
+                "3" | "" => {
+                    println!("{} Ignoring undeclared users", "[INFO]".blue());
+                }
+                _ => {
+                    println!("{} Invalid choice, ignoring", "[WARN]".yellow());
+                }
+            }
+        }
+    }
+
+    // Find users in config but not in system (create them)
+    let users_to_create: Vec<_> = declared.iter()
+        .filter(|(name, _)| !current.contains_key(*name))
+        .collect();
+
+    if !users_to_create.is_empty() {
+        println!("{} Found {} users in config that don't exist:", "[INFO]".blue(), users_to_create.len());
+        for (name, _) in &users_to_create {
+            println!("  - {}", name);
+        }
+
+        if ask_user_confirmation("Create these users?", yes, no, verbose)? {
+            for (name, config) in users_to_create {
+                create_user(name, config, verbose)?;
+                // Get the created user's UID
+                let created_info = get_current_users(false)?;
+                if let Some(info) = created_info.get(name) {
+                    state.managed_users.insert(name.clone(), ManagedUserInfo {
+                        uid: info.uid,
+                        managed_at: timestamp,
+                    });
+                }
+                println!("{} Created user {}", "[SUCCESS]".green(), name);
+            }
+        }
+    }
+
+    // Find users with different states (update them)
+    let users_to_modify: Vec<_> = declared.iter()
+        .filter_map(|(name, desired)| {
+            current.get(name).and_then(|current_info| {
+                // Check for differences
+                let uid_differs = desired.uid.map_or(false, |uid| uid != current_info.uid);
+                let gid_differs = desired.gid.map_or(false, |gid| gid != current_info.gid);
+                let home_differs = desired.home.as_ref().map_or(false, |h| h != &current_info.home);
+                let shell_differs = desired.shell.as_ref().map_or(false, |s| s != &current_info.shell);
+                let comment_differs = desired.comment.as_ref().map_or(false, |c| c != &current_info.comment);
+
+                let desired_groups_set = desired.groups.as_ref().map(|g| g.iter().collect::<std::collections::HashSet<_>>());
+                let current_groups_set = current_info.groups.iter().collect::<std::collections::HashSet<_>>();
+                let groups_differ = desired_groups_set.map_or(false, |dg| dg != current_groups_set);
+
+                if uid_differs || gid_differs || home_differs || shell_differs || comment_differs || groups_differ {
+                    Some((name, desired, current_info))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    if !users_to_modify.is_empty() {
+        println!("{} Found {} users with different states:", "[INFO]".blue(), users_to_modify.len());
+        for (name, desired, current) in &users_to_modify {
+            println!("  - {}: UID {} -> {}, shell {} -> {}, groups [{}] -> [{}]",
+                name,
+                current.uid,
+                desired.uid.map_or_else(|| current.uid.to_string(), |u| u.to_string()),
+                current.shell,
+                desired.shell.as_ref().unwrap_or(&current.shell),
+                current.groups.join(", "),
+                desired.groups.as_ref().map_or_else(|| "".to_string(), |g| g.join(", "))
+            );
+        }
+
+        if ask_user_confirmation("Apply these user changes?", yes, no, verbose)? {
+            for (name, desired, current) in users_to_modify {
+                modify_user(name, current, desired, verbose)?;
+                // Update state with new UID if changed
+                let new_uid = desired.uid.unwrap_or(current.uid);
+                state.managed_users.insert(name.clone(), ManagedUserInfo {
+                    uid: new_uid,
+                    managed_at: timestamp,
+                });
+                println!("{} Modified user {}", "[SUCCESS]".green(), name);
+            }
+        }
+    }
+
+    // Update state for all declared users
+    for (name, _config) in declared {
+        if let Some(info) = current.get(name) {
+            state.managed_users.entry(name.clone()).or_insert(ManagedUserInfo {
+                uid: info.uid,
+                managed_at: timestamp,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+// Main sync function
+fn sync_users_and_groups(yes: bool, no: bool, verbose: bool) -> Result<()> {
+    println!("{} Synchronizing users and groups with system state...", "[INFO]".blue());
+
+    // Backup files before making changes
+    backup_user_files(verbose)?;
+
+    // Load config and state
+    let config = load_users_groups_config()?;
+    let mut state = load_users_groups_state()?;
+
+    // Get current system state
+    let current_users = get_current_users(verbose)?;
+    let current_groups = get_current_groups(verbose)?;
+
+    // Check for orphaned groups (previously managed but removed from config)
+    let declared_group_names: std::collections::HashSet<_> = config.groups
+        .as_ref()
+        .map(|g| g.keys().collect())
+        .unwrap_or_default();
+
+    let orphaned_groups: Vec<_> = state.managed_groups.keys()
+        .filter(|name| !declared_group_names.contains(name) && current_groups.contains_key(*name))
+        .cloned()
+        .collect();
+
+    if !orphaned_groups.is_empty() {
+        println!("{} Found {} groups removed from config but still exist in system:", "[INFO]".blue(), orphaned_groups.len());
+        for group in &orphaned_groups {
+            println!("  - {}", group);
+        }
+
+        if ask_user_confirmation("Delete these groups from the system?", yes, no, verbose)? {
+            for group in &orphaned_groups {
+                delete_group(group)?;
+                state.managed_groups.remove(group);
+                println!("{} Deleted group {}", "[SUCCESS]".green(), group);
+            }
+        }
+    }
+
+    // Check for orphaned users (previously managed but removed from config)
+    let declared_user_names: std::collections::HashSet<_> = config.users
+        .as_ref()
+        .map(|u| u.keys().collect())
+        .unwrap_or_default();
+
+    let orphaned_users: Vec<_> = state.managed_users.keys()
+        .filter(|name| !declared_user_names.contains(name) && current_users.contains_key(*name))
+        .cloned()
+        .collect();
+
+    if !orphaned_users.is_empty() {
+        println!("{} Found {} users removed from config but still exist in system:", "[INFO]".blue(), orphaned_users.len());
+        for user in &orphaned_users {
+            println!("  - {}", user);
+        }
+
+        if ask_user_confirmation("Delete these users from the system?", yes, no, verbose)? {
+            for user in &orphaned_users {
+                if ask_user_confirmation(&format!("Remove home directory for user '{}'?", user), false, false, verbose)? {
+                    delete_user(user, true, verbose)?;
+                } else {
+                    delete_user(user, false, verbose)?;
+                }
+                state.managed_users.remove(user);
+                println!("{} Deleted user {}", "[SUCCESS]".green(), user);
+            }
+        }
+    }
+
+    // Sync groups first (users may depend on groups)
+    if let Some(declared_groups) = &config.groups {
+        sync_groups_bidirectional(declared_groups, &current_groups, &mut state, yes, no, verbose)?;
+    } else if verbose {
+        println!("{} No groups declared in config", "[DEBUG]".cyan());
+    }
+
+    // Then sync users
+    if let Some(declared_users) = &config.users {
+        sync_users_bidirectional(declared_users, &current_users, &mut state, yes, no, verbose)?;
+    } else if verbose {
+        println!("{} No users declared in config", "[DEBUG]".cyan());
+    }
+
+    // Save updated state
+    save_users_groups_state(&state)?;
+
+    println!("{} Users and groups synchronization complete", "[SUCCESS]".green());
+    Ok(())
+}
+
+// Initial config generation
+fn generate_initial_users_groups_config() -> Result<()> {
+    println!("{} Generating users and groups configuration from current system state...", "[INFO]".blue());
+
+    let current_users = get_current_users(false)?;
+    let current_groups = get_current_groups(false)?;
+
+    if current_users.is_empty() && current_groups.is_empty() {
+        println!("{} No non-system users or groups found to add to config", "[WARN]".yellow());
+        return Ok(());
+    }
+
+    update_users_groups_config_with_discovered(&current_users, &current_groups, "config/users-groups.toml")?;
+
+    println!("{} Generated config/users-groups.toml with {} users and {} groups",
+        "[SUCCESS]".green(), current_users.len(), current_groups.len());
 
     Ok(())
 }

@@ -98,6 +98,7 @@ Your entire system is defined through configuration files in the `config/` direc
 - `config/cargo-packages.toml` - Declared Rust binaries (cargo install)
 - `config/system-services.toml` - Declared system services state (systemd services as root)
 - `config/user-services.toml` - Declared user services state (systemd user services)
+- `config/users-groups.toml` - Declared users and groups state (user/group management)
 - `config/winapps-config.toml` - Windows application access via RDP (optional)
 
 ### Bootstrapping Your Configuration
@@ -353,6 +354,68 @@ WantedBy=default.target
 """
 ```
 
+### Users and Groups Configuration
+
+Declaratively manage users and groups with bidirectional synchronization:
+
+```toml
+# config/users-groups.toml
+
+[users]
+[users.john]
+uid = 1001
+gid = 1001
+groups = ["wheel", "docker", "libvirt"]
+home = "/home/john"
+shell = "/bin/bash"
+comment = "John Doe"
+create_home = true
+system = false
+
+[users.alice]
+uid = 1002
+gid = 1002
+groups = ["wheel", "developers"]
+home = "/home/alice"
+shell = "/bin/zsh"
+comment = "Alice Smith"
+
+[groups]
+[groups.developers]
+gid = 2001
+members = ["john", "alice"]
+system = false
+
+[groups.devops]
+gid = 2002
+members = ["john"]
+system = false
+```
+
+**Features:**
+- **Bidirectional sync**: Discovers existing users/groups and prompts to add to config
+- **Automatic filtering**: Only manages users (UID >= 1000) and groups (GID >= 1000)
+- **Full validation**: Username/groupname regex, UID/GID ranges, shell verification
+- **Safe ordering**: Groups are created before users that reference them
+- **Complete properties**: UID, GID, supplementary groups, home directory, shell, comment/GECOS
+- **Automatic backups**: Creates timestamped backups of /etc/passwd, /etc/group, /etc/shadow
+
+**Safety Features:**
+- Never modifies system users/groups (UID/GID < 1000)
+- Validates usernames/groupnames: `^[a-z_][a-z0-9_-]*[$]?$`
+- Verifies shells exist in `/etc/shells`
+- User confirmation prompts for all operations
+- Creates backups before any modifications
+
+**Usage:**
+```bash
+# Generate config from current system
+./fedoraforge --initial  # Creates config/users-groups.toml
+
+# Apply configuration
+./fedoraforge  # Syncs users and groups bidirectionally
+```
+
 ### VPN Configuration (WireGuard or OpenVPN)
 ```toml
 [vpn]
@@ -464,6 +527,7 @@ run_once = [
 - ✅ System and user services management from `config/system-services.toml` and `config/user-services.toml`
 - ✅ Custom service definition and deployment (systemd services defined declaratively)
 - ✅ Application autostart management (automatically creates systemd user services for applications)
+- ✅ Users and groups management with bidirectional sync from `config/users-groups.toml`
 - ✅ WinApps integration for Windows application access via RDP with Podman
 
 ### Desktop Environment
