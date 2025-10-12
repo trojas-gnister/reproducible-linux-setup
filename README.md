@@ -45,7 +45,7 @@ source ~/.cargo/env
 
 ### From Source
 ```bash
-git clone <repository-url>
+git clone https://github.com/trojas-gnister/fedoraforge
 cd fedoraforge
 cargo build --release
 ```
