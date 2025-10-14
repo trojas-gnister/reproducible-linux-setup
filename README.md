@@ -7,6 +7,7 @@ FedoraForge is a powerful declarative configuration system for Fedora Linux that
 ## 🚀 Declarative Features
 
 - **Pure Configuration**: Define your entire system state in version-controlled TOML files
+- **Auto-Discovery**: Configuration files automatically generated from current system state on first run
 - **Idempotent Operations**: Run multiple times safely - only changes what needs changing
 - **Atomic Updates**: Complete system configuration or rollback on failure
 - **Reproducible Builds**: Generate identical systems from the same configuration
@@ -52,11 +53,12 @@ cargo build --release
 
 ### Declarative Workflow
 ```bash
-# 1. Capture current system state as declarative configuration
-./target/release/fedoraforge --initial
+# 1. Run FedoraForge (auto-creates config files from current system state on first run)
+./target/release/fedoraforge
 
 # 2. Edit configuration files to declare desired state
 vim config/config.toml
+vim config/system-packages.toml
 
 # 3. Apply configuration (converge system to declared state)
 ./target/release/fedoraforge
@@ -65,6 +67,7 @@ vim config/config.toml
 ./target/release/fedoraforge --verbose
 
 # Advanced usage
+./target/release/fedoraforge --initial      # Force regeneration of all config files
 ./target/release/fedoraforge --yes          # Unattended deployment
 ./target/release/fedoraforge --config prod.toml  # Environment-specific configs
 ```
@@ -73,7 +76,7 @@ vim config/config.toml
 
 | Flag | Description |
 |------|-------------|
-| `--initial` | Generate initial configuration files from current system state |
+| `--initial` | Force regeneration of all configuration files from current system state |
 | `--config <path>` | Use custom configuration file (default: `config/config.toml`) |
 | `--verbose, -v` | Enable verbose logging for detailed output |
 | `--yes, -y` | Automatically answer yes to all prompts (unattended mode) |
@@ -88,34 +91,42 @@ vim config/config.toml
 
 ## 📖 Declarative Configuration
 
-Your entire system is defined through configuration files in the `config/` directory:
+Your entire system is defined through configuration files in the `config/` directory. **All files are automatically created from your current system state on first run**, making it easy to get started.
 
 - `config/config.toml` - System state declaration (hostname, desktop, containers, VPN, drives, WinApps)
-- `config/system-packages.toml` - Declared package state (dnf packages)
-- `config/flatpak-packages.toml` - Declared application state (Flatpak apps)
-- `config/pip-packages.toml` - Declared Python packages (pip)
-- `config/npm-packages.toml` - Declared Node.js packages (npm global)
-- `config/cargo-packages.toml` - Declared Rust binaries (cargo install)
-- `config/system-services.toml` - Declared system services state (systemd services as root)
-- `config/user-services.toml` - Declared user services state (systemd user services)
-- `config/users-groups.toml` - Declared users and groups state (user/group management)
+- `config/system-packages.toml` - Declared package state (dnf packages) - *auto-created*
+- `config/flatpak-packages.toml` - Declared application state (Flatpak apps) - *auto-created*
+- `config/pip-packages.toml` - Declared Python packages (pip) - *auto-created*
+- `config/npm-packages.toml` - Declared Node.js packages (npm global) - *auto-created*
+- `config/cargo-packages.toml` - Declared Rust binaries (cargo install) - *auto-created*
+- `config/system-services.toml` - Declared system services state (systemd services as root) - *auto-created*
+- `config/user-services.toml` - Declared user services state (systemd user services) - *auto-created*
+- `config/users-groups.toml` - Declared users and groups state (user/group management) - *auto-created*
 - `config/winapps-config.toml` - Windows application access via RDP (optional)
 
-### Bootstrapping Your Configuration
+### Automatic Configuration Discovery
 
-Capture your current system state as a declarative configuration:
+**FedoraForge automatically generates configuration files from your current system state on first run.** Simply run the application and it will introspect your system:
 
 ```bash
-./target/release/fedoraforge --initial
+./target/release/fedoraforge
 ```
 
-This introspects your system and generates:
+This automatically discovers and creates:
 - **Package declarations** from `dnf repoquery --leaves --userinstalled`
 - **Application declarations** from `flatpak list --app`
 - **Service declarations** from `systemctl list-unit-files` (system and user)
-- **Base configuration structure** in `config/`
+- **User/group declarations** from `/etc/passwd` and `/etc/group` (non-system only)
+- **Python packages** from `pip list --user`
+- **Node.js packages** from `npm list -g`
+- **Rust binaries** from `cargo install --list`
 
 Once generated, your system state becomes code - edit the TOML files to declare your desired state, then apply changes with a simple `./fedoraforge` command.
+
+**Optional: Force Regeneration**
+```bash
+./target/release/fedoraforge --initial  # Regenerate all config files
+```
 
 Here's the structure:
 
@@ -492,6 +503,13 @@ rdp_flags = "/sound /microphone +home-drive /cert:tofu"
 
 **Dependencies Installed**:
 - curl, dialog, freerdp, git, iproute, libnotify, nmap-ncat
+
+**Cleanup**:
+To remove WinApps, simply set `enable_winapps = false` in `config/config.toml` and run FedoraForge. It will automatically:
+- Stop and remove the RDPWindows container
+- Remove `~/.config/winapps` directory
+- Remove `~/.local/share/winapps` repository
+- System dependencies (freerdp, dialog, etc.) are preserved but can be manually removed if desired
 
 **Notes**:
 - First-time setup takes 15-30 minutes for Windows to install

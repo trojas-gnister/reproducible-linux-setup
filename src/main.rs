@@ -64,7 +64,6 @@ struct Config {
     vpn: Option<VpnConfig>,
     dotfiles: Option<DotfilesConfig>,
     custom_commands: Option<CustomCommandsConfig>,
-    users_groups: Option<UsersGroupsConfig>,
 }
 
 #[derive(Deserialize, Debug)]
@@ -533,12 +532,46 @@ registries = ['docker.io', 'registry.fedoraproject.org', 'quay.io', 'registry.re
 
             let configured_containers: Vec<String> = podman.containers.as_ref().unwrap_or(&Vec::new()).iter().map(|c| c.name.clone()).collect();
 
+            // Load container state for cleanup
+            let mut container_state = load_container_state()?;
+            let mut state_modified = false;
+
             for container_name in managed_containers {
                 if !configured_containers.contains(&container_name) {
-                    if ask_user_confirmation(&format!("Container '{}' is managed by this tool but not in the config. Remove it?", container_name), false, false, false)? {
+                    if ask_user_confirmation(&format!("Container '{}' is managed by this tool but not in the config. Remove it?", container_name), args.yes, args.no, args.verbose)? {
+                        // Stop systemd service if it exists
+                        let service_name = format!("{}.service", container_name);
+                        let _ = run_command(&["systemctl", "--user", "stop", &service_name], &format!("Stopping systemd service for {}", container_name));
+
+                        // Remove Quadlet file if it exists
+                        let quadlet_path = home_dir.join(".config").join("containers").join("systemd").join(format!("{}.container", container_name));
+                        if quadlet_path.exists() {
+                            fs::remove_file(&quadlet_path).context(format!("Failed to remove Quadlet file for {}", container_name))?;
+                            if args.verbose {
+                                println!("{} Removed Quadlet file: {:?}", "[DEBUG]".cyan(), quadlet_path);
+                            }
+                        }
+
+                        // Remove container
                         run_command(&["podman", "rm", "-f", &container_name], &format!("Removing orphaned container {}", container_name))?;
+
+                        // Remove from state file
+                        if container_state.containers.remove(&container_name).is_some() {
+                            state_modified = true;
+                            if args.verbose {
+                                println!("{} Removed {} from container state", "[DEBUG]".cyan(), container_name);
+                            }
+                        }
+
+                        // Reload systemd daemon to pick up changes
+                        let _ = run_command(&["systemctl", "--user", "daemon-reload"], "Reloading systemd user daemon");
                     }
                 }
+            }
+
+            // Save updated state if modified
+            if state_modified {
+                save_container_state(&container_state)?;
             }
 
             // Smart container lifecycle management
@@ -961,8 +994,38 @@ fn generate_directory_hash(dir_path: &Path) -> Result<String> {
 
 fn load_package_list(file_path: &str) -> Result<Vec<String>> {
     if !std::path::Path::new(file_path).exists() {
-        println!("{} Package file {} not found, skipping", "[WARN]".yellow(), file_path);
-        return Ok(Vec::new());
+        println!("{} Package file {} not found, creating from current system state...", "[INFO]".blue(), file_path);
+
+        // Discover packages based on file type
+        let discovered = if file_path.contains("system-packages") {
+            get_user_installed_packages()?
+        } else if file_path.contains("flatpak") {
+            get_installed_flatpaks()?
+        } else if file_path.contains("pip") {
+            get_installed_pip_packages()?
+        } else if file_path.contains("npm") {
+            get_installed_npm_packages()?
+        } else if file_path.contains("cargo") {
+            get_installed_cargo_packages()?
+        } else {
+            Vec::new()
+        };
+
+        // Create the package file
+        if !discovered.is_empty() {
+            let content = format!(
+                "# Package list\npackages = [\n{}\n]\n",
+                discovered.iter()
+                    .map(|p| format!("    \"{}\",", p))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            fs::write(file_path, content)?;
+            println!("{} Created {} with {} packages", "[SUCCESS]".green(), file_path, discovered.len());
+        } else {
+            println!("{} No packages found, creating empty config", "[INFO]".blue());
+            fs::write(file_path, "# Package list\npackages = []\n")?;
+        }
     }
 
     let content = fs::read_to_string(file_path)
@@ -1779,11 +1842,126 @@ fn install_wireguard_packages_graceful() -> Result<()> {
     Ok(())
 }
 
+fn cleanup_winapps(yes: bool, no: bool, verbose: bool) -> Result<()> {
+    let home_dir = dirs::home_dir().context("Failed to get home directory")?;
+    let winapps_config_dir = home_dir.join(".config").join("winapps");
+    let winapps_repo_dir = home_dir.join(".local").join("share").join("winapps");
+
+    // Check if WinApps is installed
+    let config_exists = winapps_config_dir.exists();
+    let repo_exists = winapps_repo_dir.exists();
+
+    if !config_exists && !repo_exists {
+        if verbose {
+            println!("{} WinApps not installed, nothing to clean up", "[DEBUG]".cyan());
+        }
+        return Ok(());
+    }
+
+    println!("{} WinApps installation detected", "[INFO]".blue());
+
+    if verbose {
+        if config_exists {
+            println!("{} Found config directory: {:?}", "[DEBUG]".cyan(), winapps_config_dir);
+        }
+        if repo_exists {
+            println!("{} Found repository: {:?}", "[DEBUG]".cyan(), winapps_repo_dir);
+        }
+    }
+
+    // Check for running containers
+    let container_check = std::process::Command::new("podman")
+        .args(["ps", "-a", "--filter", "name=RDPWindows", "--format", "{{.Names}}"])
+        .output();
+
+    let has_container = if let Ok(output) = container_check {
+        let container_list = String::from_utf8_lossy(&output.stdout);
+        !container_list.trim().is_empty()
+    } else {
+        false
+    };
+
+    if has_container && verbose {
+        println!("{} Found RDPWindows container", "[DEBUG]".cyan());
+    }
+
+    // Prompt for confirmation
+    let should_cleanup = if yes {
+        true
+    } else if no {
+        false
+    } else {
+        println!("\n{} WinApps cleanup will:", "[WARNING]".yellow());
+        if has_container {
+            println!("  • Stop and remove the RDPWindows container");
+        }
+        if config_exists {
+            println!("  • Remove config directory: {:?}", winapps_config_dir);
+        }
+        if repo_exists {
+            println!("  • Remove repository: {:?}", winapps_repo_dir);
+        }
+        println!("\n{} Do you want to proceed with cleanup?", "[PROMPT]".yellow());
+        ask_user_confirmation("Cleanup WinApps", yes, no, verbose)?
+    };
+
+    if !should_cleanup {
+        println!("{} Skipping WinApps cleanup", "[INFO]".blue());
+        return Ok(());
+    }
+
+    // Stop and remove container
+    if has_container {
+        println!("{} Stopping and removing RDPWindows container...", "[INFO]".blue());
+
+        // Try to stop with compose first if compose.yaml exists
+        let compose_file = winapps_config_dir.join("compose.yaml");
+        if compose_file.exists() {
+            let result = run_command(
+                &["podman-compose", "--file", compose_file.to_str().unwrap(), "down"],
+                "Stopping container with compose"
+            );
+            if result.is_err() && verbose {
+                println!("{} podman-compose failed, trying direct container removal", "[WARNING]".yellow());
+            }
+        }
+
+        // Force remove the container if it still exists
+        let _ = run_command(
+            &["podman", "rm", "-f", "RDPWindows"],
+            "Removing RDPWindows container"
+        );
+
+        println!("{} Container removed", "[SUCCESS]".green());
+    }
+
+    // Remove config directory
+    if config_exists {
+        println!("{} Removing config directory: {:?}", "[INFO]".blue(), winapps_config_dir);
+        fs::remove_dir_all(&winapps_config_dir)
+            .with_context(|| format!("Failed to remove config directory {:?}", winapps_config_dir))?;
+        println!("{} Config directory removed", "[SUCCESS]".green());
+    }
+
+    // Remove repository
+    if repo_exists {
+        println!("{} Removing repository: {:?}", "[INFO]".blue(), winapps_repo_dir);
+        fs::remove_dir_all(&winapps_repo_dir)
+            .with_context(|| format!("Failed to remove repository {:?}", winapps_repo_dir))?;
+        println!("{} Repository removed", "[SUCCESS]".green());
+    }
+
+    println!("{} WinApps cleanup completed!", "[SUCCESS]".green().bold());
+    println!("{} Dependencies (freerdp, dialog, etc.) were NOT removed", "[INFO]".blue());
+    println!("     Run 'sudo dnf remove freerdp dialog libnotify nmap-ncat' to remove them manually if needed", );
+
+    Ok(())
+}
+
 fn setup_winapps(enable_winapps: bool, args: &Args) -> Result<()> {
     if !enable_winapps {
-        if args.verbose {
-            println!("{} WinApps is disabled, skipping setup", "[DEBUG]".cyan());
-        }
+        // When disabled, offer to cleanup existing installation
+        cleanup_winapps(args.yes, args.no, args.verbose)?;
         return Ok(());
     }
 
@@ -3598,7 +3776,26 @@ fn extract_exec_from_desktop_file(desktop_file: &str) -> Result<String> {
 // ========================= CONFIG LOADING AND SAVING =========================
 
 fn load_system_services_config() -> Result<SystemServicesConfig> {
-    let config_content = fs::read_to_string("config/system-services.toml")
+    let config_path = "config/system-services.toml";
+
+    if !Path::new(config_path).exists() {
+        println!("{} config/system-services.toml not found, creating from current system state...", "[INFO]".blue());
+        let current = get_current_system_services(false)?;
+        let enabled: Vec<_> = current.iter()
+            .filter(|(_, info)| info.enabled)
+            .collect();
+
+        if !enabled.is_empty() {
+            update_services_config_with_discovered(&enabled, config_path, ServiceScope::System)?;
+            println!("{} Created config/system-services.toml with {} enabled services",
+                "[SUCCESS]".green(), enabled.len());
+        } else {
+            println!("{} No enabled system services found, creating empty config", "[INFO]".blue());
+            fs::write(config_path, "# System services configuration\n[services]\n\n[custom_services]\n")?;
+        }
+    }
+
+    let config_content = fs::read_to_string(config_path)
         .with_context(|| "Failed to read config/system-services.toml")?;
     let config: SystemServicesConfig = toml::from_str(&config_content)
         .with_context(|| "Failed to parse system-services.toml")?;
@@ -3606,7 +3803,26 @@ fn load_system_services_config() -> Result<SystemServicesConfig> {
 }
 
 fn load_user_services_config() -> Result<UserServicesConfig> {
-    let config_content = fs::read_to_string("config/user-services.toml")
+    let config_path = "config/user-services.toml";
+
+    if !Path::new(config_path).exists() {
+        println!("{} config/user-services.toml not found, creating from current user state...", "[INFO]".blue());
+        let current = get_current_user_services(false)?;
+        let enabled: Vec<_> = current.iter()
+            .filter(|(_, info)| info.enabled)
+            .collect();
+
+        if !enabled.is_empty() {
+            update_services_config_with_discovered(&enabled, config_path, ServiceScope::User)?;
+            println!("{} Created config/user-services.toml with {} enabled services",
+                "[SUCCESS]".green(), enabled.len());
+        } else {
+            println!("{} No enabled user services found, creating empty config", "[INFO]".blue());
+            fs::write(config_path, "# User services configuration\n[services]\n\n[applications]\n\n[custom_services]\n")?;
+        }
+    }
+
+    let config_content = fs::read_to_string(config_path)
         .with_context(|| "Failed to read config/user-services.toml")?;
     let config: UserServicesConfig = toml::from_str(&config_content)
         .with_context(|| "Failed to parse user-services.toml")?;
@@ -3959,10 +4175,20 @@ fn load_users_groups_config() -> Result<UsersGroupsConfig> {
     let config_path = "config/users-groups.toml";
 
     if !Path::new(config_path).exists() {
-        return Ok(UsersGroupsConfig {
-            users: None,
-            groups: None,
-        });
+        println!("{} config/users-groups.toml not found, creating from current system state...", "[INFO]".blue());
+
+        let current_users = get_current_users(false)?;
+        let current_groups = get_current_groups(false)?;
+
+        if !current_users.is_empty() || !current_groups.is_empty() {
+            update_users_groups_config_with_discovered(&current_users, &current_groups, config_path)?;
+            println!("{} Created config/users-groups.toml with {} users and {} groups",
+                "[SUCCESS]".green(), current_users.len(), current_groups.len());
+        } else {
+            println!("{} No non-system users or groups found, creating empty config", "[INFO]".blue());
+            // Create empty config file
+            fs::write(config_path, "[users]\n\n[groups]\n")?;
+        }
     }
 
     let content = fs::read_to_string(config_path)
